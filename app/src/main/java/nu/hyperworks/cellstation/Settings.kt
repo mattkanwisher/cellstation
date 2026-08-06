@@ -74,6 +74,20 @@ object Settings {
 
     private const val KEY_DEVICE_PROFILE = "applied_device_profile"
 
+    /**
+     * Host CPU/GPU counters drawn over the game. Distinct from the core's own
+     * performance overlay, which reports emulated load — this one answers
+     * whether the phone itself is CPU- or GPU-bound.
+     */
+    fun hostStats(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_HOST_STATS, false)
+
+    fun setHostStats(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_HOST_STATS, enabled).apply()
+    }
+
+    private const val KEY_HOST_STATS = "host_stats"
+
     /** Directory name under gpu_drivers/ of the selected driver; "" = system. */
     fun gpuDriver(context: Context): String =
         prefs(context).getString(KEY_GPU_DRIVER, "").orEmpty()

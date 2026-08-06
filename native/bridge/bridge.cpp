@@ -53,6 +53,10 @@
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <sys/resource.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <ctime>
 
 #include <deque>
 
@@ -232,6 +236,207 @@ namespace
 	// ---- surface state -----------------------------------------------------
 	atomic_t<ANativeWindow*> g_native_window{nullptr};
 
+	// ---- ADPF (Android Dynamic Performance Framework) ----------------------
+	//
+	// The power HAL cannot distinguish a latency-sensitive workload from a
+	// merely busy one. A hint session names the threads that have to meet a
+	// deadline and reports how long their work actually took, so the governor
+	// holds clocks rather than inferring demand from utilisation alone.
+	//
+	// That distinction matters more here than it might elsewhere: profiling
+	// showed the SPU threads spend much of their time spinning on range locks
+	// (docs/PROFILE-doa5.md), so a utilisation-based governor sees fully busy
+	// cores that are achieving nothing and can draw the opposite of the right
+	// conclusion.
+	//
+	// The NDK in this toolchain ships no <android/performance_hint.h>, so the
+	// API is resolved from libandroid.so at runtime. It is API 31+; on older
+	// devices the symbols are simply absent and everything here is a no-op.
+	//
+	// This lives on the native side rather than in Kotlin because the report
+	// is only meaningful once per frame, and the flip callback below is the
+	// only place that knows when a frame ended.
+	namespace adpf
+	{
+		struct manager_t;
+		struct session_t;
+
+		manager_t* (*get_manager)() = nullptr;
+		session_t* (*create_session)(manager_t*, const s32*, usz, s64) = nullptr;
+		int (*report_actual)(session_t*, s64) = nullptr;
+		int (*set_threads)(session_t*, const s32*, usz) = nullptr;
+		void (*close_session)(session_t*) = nullptr;
+
+		session_t* g_session = nullptr;
+
+		// The set the session was last told about, kept sorted so it can be
+		// compared cheaply against a fresh scan.
+		std::vector<s32> g_tids;
+
+		// 60 Hz. Reporting an actual duration longer than this is the signal
+		// that asks for more clock, which is the honest state of affairs for a
+		// game we cannot yet run at full speed.
+		constexpr s64 target_ns = 16'666'666;
+
+		s64 now_ns()
+		{
+			timespec ts{};
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			return static_cast<s64>(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
+		}
+
+		// The emulated CPUs and the renderer, by thread name. These do not
+		// exist until a game is running, which is why the session is built on
+		// the first flip rather than at startup.
+		std::vector<s32> emu_thread_ids()
+		{
+			std::vector<s32> out;
+
+			DIR* d = opendir("/proc/self/task");
+			if (!d) return out;
+
+			while (dirent* e = readdir(d))
+			{
+				const int tid = atoi(e->d_name);
+				if (tid <= 0) continue;
+
+				char path[64]{};
+				snprintf(path, sizeof(path), "/proc/self/task/%d/comm", tid);
+
+				const int fd = open(path, O_RDONLY);
+				if (fd < 0) continue;
+
+				char comm[32]{};
+				const ssize_t n = read(fd, comm, sizeof(comm) - 1);
+				close(fd);
+				if (n <= 0) continue;
+
+				if (!std::strncmp(comm, "PPU[", 4) || !std::strncmp(comm, "SPU[", 4) ||
+				    !std::strncmp(comm, "rsx::thread", 11))
+				{
+					out.push_back(tid);
+				}
+			}
+
+			closedir(d);
+			std::sort(out.begin(), out.end());
+			return out;
+		}
+
+		bool resolve()
+		{
+			void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+			if (!lib) return false;
+
+			get_manager    = reinterpret_cast<decltype(get_manager)>(dlsym(lib, "APerformanceHint_getManager"));
+			create_session = reinterpret_cast<decltype(create_session)>(dlsym(lib, "APerformanceHint_createSession"));
+			report_actual  = reinterpret_cast<decltype(report_actual)>(dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
+			close_session  = reinterpret_cast<decltype(close_session)>(dlsym(lib, "APerformanceHint_closeSession"));
+
+			// API 34. Without it the session can only be re-made from scratch.
+			set_threads    = reinterpret_cast<decltype(set_threads)>(dlsym(lib, "APerformanceHint_setThreads"));
+
+			if (!get_manager || !create_session || !report_actual)
+			{
+				cellstation_log.notice("ADPF: unavailable (needs API 31)");
+				return false;
+			}
+
+			return true;
+		}
+
+		// The thread set is not stable: SPU threads are created as the game
+		// starts using them, long after the first frame is presented, and come
+		// and go over a session. A set fixed at the first flip would name the
+		// PPU and RSX threads only — which is precisely the case this misses,
+		// since the SPU threads are the ones under real deadline pressure.
+		void sync_threads()
+		{
+			std::vector<s32> tids = emu_thread_ids();
+
+			if (tids.empty() || tids == g_tids)
+				return;
+
+			if (g_session && set_threads)
+			{
+				if (set_threads(g_session, tids.data(), tids.size()) == 0)
+				{
+					cellstation_log.notice("ADPF: tracking %u threads (was %u)", tids.size(), g_tids.size());
+					g_tids = std::move(tids);
+					return;
+				}
+			}
+
+			// No setThreads, or it refused: rebuild the session.
+			if (g_session && close_session)
+				close_session(g_session);
+			g_session = nullptr;
+
+			manager_t* mgr = get_manager();
+			if (!mgr)
+			{
+				cellstation_log.notice("ADPF: no hint manager (device opted out)");
+				return;
+			}
+
+			g_session = create_session(mgr, tids.data(), tids.size(), target_ns);
+
+			if (g_session)
+			{
+				cellstation_log.notice("ADPF: hint session for %u threads, target %d us", tids.size(), static_cast<int>(target_ns / 1000));
+				g_tids = std::move(tids);
+			}
+			else
+			{
+				cellstation_log.notice("ADPF: createSession failed for %u threads", tids.size());
+				g_tids.clear();
+			}
+		}
+
+		// Called from the RSX thread on every flip, so no synchronisation is
+		// needed on the statics below.
+		void on_flip()
+		{
+			static bool usable = [] { return resolve(); }();
+			static s64 last = 0;
+			static u32 frames = 0;
+
+			if (!usable) return;
+
+			// Rescanning /proc costs a few dozen small reads, so do it every
+			// couple of seconds rather than per frame. Startup is when the set
+			// actually churns, so scan eagerly for the first few frames.
+			if (frames < 8 || frames % 240 == 0)
+				sync_threads();
+
+			frames++;
+
+			const s64 now = now_ns();
+
+			if (g_session && last)
+			{
+				const s64 elapsed = now - last;
+
+				// A frame boundary that long means the emulator stalled on
+				// something other than rendering — shader compilation, or a
+				// load. Reporting it would tell the governor a deadline was
+				// missed by seconds and is not useful.
+				if (elapsed > 0 && elapsed < 1'000'000'000)
+					report_actual(g_session, elapsed);
+			}
+
+			last = now;
+		}
+
+		void stop()
+		{
+			if (g_session && close_session)
+				close_session(g_session);
+			g_session = nullptr;
+			g_tids.clear();
+		}
+	}
+
 	// ---- GS frame over ANativeWindow --------------------------------------
 	class android_gs_frame final : public GSFrameBase
 	{
@@ -246,7 +451,7 @@ namespace
 		void delete_context(draw_context_t) override {}
 		draw_context_t make_context() override { return nullptr; }
 		void set_current(draw_context_t) override {}
-		void flip(draw_context_t, bool /*skip_frame*/) override {}
+		void flip(draw_context_t, bool /*skip_frame*/) override { adpf::on_flip(); }
 
 		int client_width() override
 		{
@@ -371,7 +576,7 @@ namespace
 		{
 			return std::make_unique<android_gs_frame>();
 		};
-		callbacks.close_gs_frame = []() {};
+		callbacks.close_gs_frame = []() { adpf::stop(); };
 
 		callbacks.get_camera_handler = []() -> std::shared_ptr<camera_handler_base> { return std::make_shared<null_camera_handler>(); };
 		callbacks.get_music_handler = []() -> std::shared_ptr<music_handler_base> { return std::make_shared<null_music_handler>(); };
