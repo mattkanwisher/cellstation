@@ -188,10 +188,22 @@ class TouchOverlayView(context: Context, private val pad: PadState) : View(conte
     }
 
     /** Releases everything, e.g. when the overlay is hidden mid-press. */
+    /**
+     * Releases only the controls this overlay is actually holding down.
+     *
+     * Deliberately not [PadState.releaseAll]: this is called when a physical
+     * pad retires the overlay mid-session, and by then the key press that
+     * triggered the retirement has already been written to the same shared
+     * pad state. Zeroing everything would swallow it, so the first press on a
+     * real controller would do nothing but dismiss the touch controls.
+     */
     fun releaseAll() {
         activePointers.clear()
-        controls.forEach { it.pressed = false }
-        pad.releaseAll()
+        for (c in controls) {
+            if (!c.pressed) continue
+            c.pressed = false
+            pad.setVirtual(c.index, false)
+        }
         invalidate()
     }
 }
