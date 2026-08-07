@@ -239,6 +239,19 @@ class SettingsActivity : AppCompatActivity() {
         renderHostStats()
 
         row(
+            getString(R.string.row_adpf),
+            getString(R.string.row_adpf_sub),
+            Ui.segmented(
+                this,
+                listOf(getString(R.string.opt_off), getString(R.string.opt_on)),
+                if (Settings.adpf(this)) 1 else 0
+            ) { i ->
+                Settings.setAdpf(this, i == 1)
+                EmuBridge.setAdpfEnabled(i == 1)
+            }
+        )
+
+        row(
             getString(R.string.row_online_data),
             getString(R.string.row_online_data_sub),
             Ui.segmented(

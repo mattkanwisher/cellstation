@@ -133,6 +133,12 @@ object EmuBridge {
 
     external fun setPadConnected(connected: Boolean)
 
+    /**
+     * Enables ADPF performance hints. Takes effect on the next flip, so it can
+     * be flipped mid-scene to A/B the same moment of a game.
+     */
+    external fun setAdpfEnabled(enabled: Boolean)
+
     external fun kill()
     external fun pause()
     external fun resume()

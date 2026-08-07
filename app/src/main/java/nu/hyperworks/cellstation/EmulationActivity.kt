@@ -227,6 +227,9 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
             EmulationService.start(this, java.io.File(path).nameWithoutExtension)
 
             val stretch = intentBoolean(EXTRA_STRETCH)
+            // Read before boot: the flip path consults this on every frame, so
+            // it is in effect from the first presented frame onward.
+            EmuBridge.setAdpfEnabled(Settings.adpf(this))
             thread(name = "EmuBoot") {
                 val result = EmuBridge.boot(path)
                 if (result != 0) {
@@ -243,8 +246,6 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
                     EmuBridge.setStretchToDisplayArea(stretch, persist = false)
                 }
 
-                // The PPU/SPU/RSX threads only exist once the game has booted,
-                // and they are what the hint session needs to name.
             }
         }
     }
@@ -310,6 +311,10 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
         // is suspended should take effect on the way back in, without making
         // the player quit and relaunch to find out whether it helped.
         pad.keyMapping = KeyMap.load(this)
+        // Same reasoning for the performance hints, and it makes them testable:
+        // the setting can be re-applied without ending the session, so the same
+        // scene can be measured with and without them.
+        EmuBridge.setAdpfEnabled(Settings.adpf(this))
         EmuBridge.setPadConnected(true)
     }
 

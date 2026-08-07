@@ -269,6 +269,10 @@ namespace
 
 		session_t* g_session = nullptr;
 
+		// Set from the Kotlin side before boot. Experimental, so it is worth
+		// being able to A/B a scene with and without it.
+		atomic_t<bool> g_enabled{true};
+
 		// The set the session was last told about, kept sorted so it can be
 		// compared cheaply against a fresh scan.
 		std::vector<s32> g_tids;
@@ -393,6 +397,8 @@ namespace
 			}
 		}
 
+		void stop();
+
 		// Called from the RSX thread on every flip, so no synchronisation is
 		// needed on the statics below.
 		void on_flip()
@@ -402,6 +408,15 @@ namespace
 			static u32 frames = 0;
 
 			if (!usable) return;
+
+			if (!g_enabled)
+			{
+				// Toggled off mid-session: drop the hints rather than leaving a
+				// stale session reporting nothing, which would keep whatever
+				// boost it last asked for.
+				if (g_session) stop();
+				return;
+			}
 
 			// Rescanning /proc costs a few dozen small reads, so do it every
 			// couple of seconds rather than per frame. Startup is when the set
@@ -1452,6 +1467,12 @@ JNIEXPORT jboolean JNICALL Java_nu_hyperworks_cellstation_EmuBridge_surfaceEvent
 	if (ANativeWindow* old = g_native_window.exchange(nullptr))
 		ANativeWindow_release(old);
 	return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL Java_nu_hyperworks_cellstation_EmuBridge_setAdpfEnabled(JNIEnv*, jclass, jboolean enabled)
+{
+	adpf::g_enabled = enabled == JNI_TRUE;
+	cellstation_log.notice("ADPF: %s by setting", enabled == JNI_TRUE ? "enabled" : "disabled");
 }
 
 JNIEXPORT void JNICALL Java_nu_hyperworks_cellstation_EmuBridge_setPadState(JNIEnv* env, jclass, jbyteArray jvalues)

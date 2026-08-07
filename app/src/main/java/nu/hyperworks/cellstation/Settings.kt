@@ -88,6 +88,19 @@ object Settings {
 
     private const val KEY_HOST_STATS = "host_stats"
 
+    /**
+     * Android Dynamic Performance Framework hints. Experimental: it tells the
+     * power governor which threads are on a frame deadline and how long their
+     * work took. Read once at boot, so a change needs a restart of the game.
+     */
+    fun adpf(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_ADPF, true)
+
+    fun setAdpf(context: Context, enabled: Boolean) =
+        prefs(context).edit().putBoolean(KEY_ADPF, enabled).apply()
+
+    private const val KEY_ADPF = "adpf"
+
     /** Directory name under gpu_drivers/ of the selected driver; "" = system. */
     fun gpuDriver(context: Context): String =
         prefs(context).getString(KEY_GPU_DRIVER, "").orEmpty()
