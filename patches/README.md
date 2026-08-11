@@ -129,6 +129,15 @@ Use `git -C rpcs3 checkout -- . && git -C rpcs3 clean -fd` to reset the submodul
     GETLLAR/PUTLLC via `vm::reservation_op`; publish/notify only on actual
     line change). WIP: DOA5U schedules and reaches ~42 fps then stalls.
     Upstream-status: local-only (experiment).
+19. `0021-spurs-dsp-effect-hle.patch` — replace patch 0020's mstream DSP
+    *bypass* with real host C++ effects (meter, biquad filter/EQ, I3DL2
+    reverb) behind default-off `SPU DSP HLE (experimental)`. Generalizes the
+    DSP stop code into one reserved code per effect; a registration call
+    self-registers the vtable, a processing call runs the host kernel from
+    `native/spu-hle/dsp_effects.hpp` in place over the audio block at the EA.
+    `SPU DSP HLE record` dumps job I/O to `<cache>/spu-dsp-capture.dspcap` for
+    the host oracle (`native/spu-hle/oracle`). Arming: `docs/spurs/audio-stub/
+    patch-hle.yml`. Depends on 0020. Upstream-status: local-only (experiment).
 16. `0016-vk-unknown-gpu-safe-transport.patch` — `chip_class::unknown` is 0,
     so any GPU whose vendor `get_chip_family()` doesn't recognize (e.g.
     Adreno) satisfied `gpu_family < chip_class::NV_turing` and took an

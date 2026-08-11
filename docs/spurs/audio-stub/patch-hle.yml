@@ -1,0 +1,41 @@
+Version: 1.2
+
+# SPU DSP HLE arming (patch 0021). Writes one reserved SPU stop code per mstream
+# effect at the plugin's registration entry — the same 0x90/0x98 sites the bypass
+# (patch-bypass.yml) used, but a distinct code per effect so the C++ handler
+# (cellSpursSpu.cpp spursHleStop) knows which host effect to run. The word value
+# is the raw stop instruction == the 14-bit code:
+#   0x3f88 meter, 0x3f89 filter, 0x3f8a para_eq, 0x3f8b i3dl2, 0x3f8c atrac.
+# Enable alongside the "SPU DSP HLE (experimental)" core flag; with the flag off,
+# an armed plugin falls through as a dry bypass (audio untouched).
+
+"SPU-b5522754fbebb4db82061beea60da968ff46da64":
+  "hle meter":
+    Games: {"Dead or Alive 5 Ultimate": {BLUS31216: [ All ]}}
+    Author: SPU-HLE pipeline
+    Patch Version: "1.0"
+    Patch: [ [ be32, 0x90, 0x00003f88 ] ]
+"SPU-2379c584746bcc87e8d87e1fdcd112600d090dc3":
+  "hle filter":
+    Games: {"Dead or Alive 5 Ultimate": {BLUS31216: [ All ]}}
+    Author: SPU-HLE pipeline
+    Patch Version: "1.0"
+    Patch: [ [ be32, 0x90, 0x00003f89 ] ]
+"SPU-e433af6d732c289fddceca260581a622e2a356d1":
+  "hle para_eq":
+    Games: {"Dead or Alive 5 Ultimate": {BLUS31216: [ All ]}}
+    Author: SPU-HLE pipeline
+    Patch Version: "1.0"
+    Patch: [ [ be32, 0x98, 0x00003f8a ] ]
+"SPU-6783990ef3164dee43c67f62758719c58ccccc9e":
+  "hle i3dl2":
+    Games: {"Dead or Alive 5 Ultimate": {BLUS31216: [ All ]}}
+    Author: SPU-HLE pipeline
+    Patch Version: "1.0"
+    Patch: [ [ be32, 0x98, 0x00003f8b ] ]
+"SPU-702a721b683f370f79d5653baded1b015118d2ea":
+  "hle atrac (scaffold: passthrough, must route to ffmpeg)":
+    Games: {"Dead or Alive 5 Ultimate": {BLUS31216: [ All ]}}
+    Author: SPU-HLE pipeline
+    Patch Version: "1.0"
+    Patch: [ [ be32, 0x3050, 0x00003f8c ] ]
