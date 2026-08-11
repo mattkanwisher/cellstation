@@ -14,15 +14,13 @@ handler read a never-refreshed LS mirror of the SPURS structure; the select-
 workload read-modify-write was not atomic against the modules' GETLLAR/PUTLLC;
 and unconditional publishes starved the modules' PUTLLCs (now publishes, and
 notifies reservation waiters, only when the lock line actually changed).
-Status: WIP experiment with rate-limited diagnostics left in. DOA5U: both SPURS
-instances schedule -- the system instance's audio job chain heartbeats at the
-correct 187 Hz cadence and the main instance runs the game's real job chains for
-the first second -- then the PPU side stops feeding work and stalls (frame loop
-froze at 42 fps). Verified against the real kernel2 disassembly (captured via
-SPU Debug): select writes the same lock-line quads (contention/pending/flag/
-signal+idling) and correctly leaves ready counts to the modules. Next suspect:
-the wklFlag (frame-sync) delivery semantics. Includes a deploy-time reference
-dump of recognized kernel images to <cache>/spurs-kernel-<hash>.bin.
+Status: WIP with rate-limited diagnostics. DOA5U under HLE: both instances
+schedule (audio heartbeats at its correct 187 Hz cadence; main instance runs
+the game's job chains ~1 s), wklFlag is unused by this title (receiver 0xFF),
+kernel context layout verified against the real kernel2 disassembly
+(docs/spurs/doa5u-kernel2-blocks.txt). Remaining stall: PPU threads cycle
+lwmutex/lwcond/event_queue_receive waiting on a SPURS job completion event
+that never arrives - completion-notification path under investigation.
 Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 --- a/rpcs3/Emu/system_config.h
 +++ b/rpcs3/Emu/system_config.h
@@ -264,11 +262,11 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 +		if (n < 32 || !(n & 1023))
 +		{
 +			const auto spurs = ctxt->spurs.get_ptr();
-+			cellSpurs.warning("SPURS HLE exit[%u]: spurs=0x%x prev_wid=%u ready1[0]=%u ready2[0]=%u cur[0]=0x%x pend[0]=0x%x max[0]=0x%x sig1=0x%x sig2=0x%x msg=0x%x idling=0x%x runnable1=0x%x runnable2=0x%x prio[0]=0x%x",
++			cellSpurs.warning("SPURS HLE exit[%u]: spurs=0x%x prev_wid=%u ready1[0]=%u ready2[0]=%u cur[0]=0x%x pend[0]=0x%x max[0]=0x%x sig1=0x%x sig2=0x%x msg=0x%x idling=0x%x runnable1=0x%x runnable2=0x%x prio[0]=0x%x flag=0x%x rcv=%u",
 +				n, ctxt->spurs.addr(), +ctxt->wklCurrentId, +spurs->wklReadyCount1[0], +spurs->wklIdleSpuCountOrReadyCount2[0],
 +				+spurs->wklCurrentContention[0], +spurs->wklPendingContention[0], +spurs->wklMaxContention[0],
 +				+spurs->wklSignal1.load(), +spurs->wklSignal2.load(), +spurs->sysSrvMessage.load(), +spurs->spuIdling,
-+				+ctxt->wklRunnable1, +ctxt->wklRunnable2, +ctxt->priority[0]);
++				+ctxt->wklRunnable1, +ctxt->wklRunnable2, +ctxt->priority[0], +spurs->wklFlag.flag.load(), +spurs->wklFlagReceiver.load());
 +		}
 +	}
 +
