@@ -1,0 +1,277 @@
+Subject: vk: recover from VK_ERROR_SURFACE_LOST instead of dying
+Why: Android destroys a backgrounded app's native window, and with it the
+     VkSurfaceKHR; the RSX thread then died in vk::die_with_error when
+     vkAcquireNextImageKHR returned SURFACE_LOST (only OUT_OF_DATE was
+     handled). Treat surface loss like an out-of-date swapchain - pause
+     presentation, drain flips - and on the next rebuild recreate the
+     surface itself from the new window before the swapchain (ANDROID-
+     gated; a desktop window outlives the renderer so this path never
+     runs there). Surface queries inside swapchain init fail softly for
+     the same reason.
+Upstream-status: candidate
+
+diff --git a/rpcs3/Emu/RSX/VK/VKGSRender.h b/rpcs3/Emu/RSX/VK/VKGSRender.h
+index 6b7ea5a..cbeaac5 100644
+--- a/rpcs3/Emu/RSX/VK/VKGSRender.h
++++ b/rpcs3/Emu/RSX/VK/VKGSRender.h
+@@ -118,6 +118,9 @@ private:
+ 	sizeu m_swapchain_dims{};
+ 	bool swapchain_unavailable = false;
+ 	bool should_reinitialize_swapchain = false;
++	// Set when the presentation surface itself died (VK_ERROR_SURFACE_LOST):
++	// the next swapchain rebuild must recreate the surface as well.
++	bool surface_lost = false;
+ 
+ 	u64 m_last_heap_sync_time = 0;
+ 	u32 m_texbuffer_view_size = 0;
+diff --git a/rpcs3/Emu/RSX/VK/VKPresent.cpp b/rpcs3/Emu/RSX/VK/VKPresent.cpp
+index b5ba9c4..658b05b 100644
+--- a/rpcs3/Emu/RSX/VK/VKPresent.cpp
++++ b/rpcs3/Emu/RSX/VK/VKPresent.cpp
+@@ -83,6 +83,28 @@ bool VKGSRender::reinitialize_swapchain()
+ 	// Drain all the queues
+ 	vkDeviceWaitIdle(*m_device);
+ 
++#ifdef ANDROID
++	if (surface_lost)
++	{
++		display_handle_t window_handle = m_frame->handle();
++		if (!std::get<ANativeWindow*>(window_handle))
++		{
++			// The window vanished again between the client-area check above and
++			// now. Keep the dead surface flagged and wait for the next one.
++			swapchain_unavailable = true;
++			return false;
++		}
++
++		// The WM destroyed the native window this surface was created on; the
++		// surface and its swapchain are permanently dead. Rebuild both against
++		// the window we hold now. Order matters: the swapchain must go before
++		// the surface it references.
++		m_swapchain->drop_surface();
++		m_swapchain->set_surface(m_instance.recreate_surface(window_handle));
++		surface_lost = false;
++	}
++#endif
++
+ 	// Reset frame context storage
+ 	for (auto& ctx : m_frame_context_storage)
+ 	{
+@@ -98,6 +120,13 @@ bool VKGSRender::reinitialize_swapchain()
+ 	{
+ 		rsx_log.warning("Swapchain initialization failed. Request ignored [%dx%d]", m_swapchain_dims.width, m_swapchain_dims.height);
+ 		swapchain_unavailable = true;
++#ifdef ANDROID
++		// If init fails while the window reports a live, non-zero client area,
++		// the likeliest cause is that the surface died with a previous window
++		// (its queries answer SURFACE_LOST). Rebuild the surface on the next
++		// attempt as well.
++		surface_lost = true;
++#endif
+ 		return false;
+ 	}
+ 
+@@ -161,6 +190,13 @@ void VKGSRender::present(vk::frame_context_t *ctx)
+ 		case VK_ERROR_OUT_OF_DATE_KHR:
+ 			swapchain_unavailable = true;
+ 			break;
++		case VK_ERROR_SURFACE_LOST_KHR:
++			// The WM took the window away (e.g. Android backgrounding). Pause
++			// presentation; the rebuild path recreates the surface as well.
++			rsx_log.warning("vkQueuePresentKHR failed with VK_ERROR_SURFACE_LOST. Presentation is paused until the WM provides a new surface.");
++			surface_lost = true;
++			swapchain_unavailable = true;
++			break;
+ 		default:
+ 			// Other errors not part of rpcs3. This can be caused by 3rd party injectors with bad code, of which we have no control over.
+ 			// Let the application attempt to recover instead of crashing outright.
+@@ -453,6 +489,18 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
+ 				return;
+ 			}
+ 
++#ifdef ANDROID
++			// A destroyed window cannot come back within any bounded retry
++			// count - only a new surface from the WM brings it back. Drain the
++			// flip instead of failing the ensure below.
++			if (!m_frame->client_width() || !m_frame->client_height())
++			{
++				m_frame->flip(m_context);
++				rsx::thread::flip(info);
++				return;
++			}
++#endif
++
+ 			std::this_thread::sleep_for(100ms);
+ 		}
+ 	}
+@@ -608,11 +656,36 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
+ 		case VK_SUBOPTIMAL_KHR:
+ 			should_reinitialize_swapchain = true;
+ 			break;
++		case VK_ERROR_SURFACE_LOST_KHR:
++			rsx_log.warning("vkAcquireNextImageKHR failed with VK_ERROR_SURFACE_LOST. Presentation is paused until the WM provides a new surface.");
++			surface_lost = true;
++			[[fallthrough]];
+ 		case VK_ERROR_OUT_OF_DATE_KHR:
+-			rsx_log.warning("vkAcquireNextImageKHR failed with VK_ERROR_OUT_OF_DATE_KHR. Flip request ignored until surface is recreated.");
++			if (status == VK_ERROR_OUT_OF_DATE_KHR)
++			{
++				rsx_log.warning("vkAcquireNextImageKHR failed with VK_ERROR_OUT_OF_DATE_KHR. Flip request ignored until surface is recreated.");
++			}
++
+ 			swapchain_unavailable = true;
+ 			reinitialize_swapchain();
+-			ensure(m_current_frame, "Could not reinitialize swapchain after VK_ERROR_OUT_OF_DATE_KHR signal!");
++
++			if (swapchain_unavailable || !m_current_frame)
++			{
++				// The surface cannot come back on its own (destroyed window on
++				// Android, minimized window elsewhere). Drain this flip the way
++				// the skip path does and wait for the WM to provide a window.
++				if (m_current_frame)
++				{
++					m_current_frame->swap_command_buffer = m_current_command_buffer;
++					flush_command_queue(true);
++					vk::advance_frame_counter();
++					frame_context_cleanup(m_current_frame);
++				}
++
++				m_frame->flip(m_context);
++				rsx::thread::flip(info);
++				return;
++			}
+ 			continue;
+ 		default:
+ 			vk::die_with_error(status);
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/instance.cpp b/rpcs3/Emu/RSX/VK/vkutils/instance.cpp
+index 49224fc..3e498df 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/instance.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/instance.cpp
+@@ -263,6 +263,22 @@ namespace vk
+ 		return gpus;
+ 	}
+ 
++	VkSurfaceKHR instance::recreate_surface(display_handle_t window_handle)
++	{
++		if (m_surface)
++		{
++			vkDestroySurfaceKHR(m_instance, m_surface, nullptr);
++			m_surface = VK_NULL_HANDLE;
++		}
++
++		WSI_config surface_config
++		{
++			.supports_automatic_wm_reports = true
++		};
++		m_surface = make_WSI_surface(m_instance, window_handle, &surface_config);
++		return m_surface;
++	}
++
+ 	swapchain_base* instance::create_swapchain(display_handle_t window_handle, vk::physical_device& dev)
+ 	{
+ 		WSI_config surface_config
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/instance.h b/rpcs3/Emu/RSX/VK/vkutils/instance.h
+index b4b87b1..650e850 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/instance.h
++++ b/rpcs3/Emu/RSX/VK/vkutils/instance.h
+@@ -60,5 +60,10 @@ namespace vk
+ 		std::vector<physical_device>& enumerate_devices();
+ 
+ 		swapchain_base* create_swapchain(display_handle_t window_handle, vk::physical_device& dev);
++
++		// Replace the presentation surface after surface loss (the WM destroyed
++		// the native window it was created on). The caller must have destroyed
++		// any swapchain created against the old surface first.
++		VkSurfaceKHR recreate_surface(display_handle_t window_handle);
+ 	};
+ }
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp b/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
+index fe4464c..6915f03 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
+@@ -187,7 +187,15 @@ namespace vk
+ 		}
+ #endif
+ 		VkSurfaceCapabilitiesKHR surface_descriptors = {};
+-		CHECK_RESULT(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.gpu(), m_surface, &surface_descriptors));
++		if (VkResult status = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.gpu(), m_surface, &surface_descriptors); status != VK_SUCCESS)
++		{
++			// A lost surface (e.g. Android destroyed the native window) answers
++			// this query with an error. Report unusable zero-extent capabilities
++			// so init() fails softly and the caller can retry once the WM
++			// provides a working surface again.
++			rsx_log.warning("Swapchain: vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed with status 0x%x", static_cast<s32>(status));
++			surface_descriptors = {};
++		}
+ 		return { surface_descriptors, false };
+ 	}
+ 
+@@ -226,10 +234,22 @@ namespace vk
+ 		}
+ 
+ 		u32 nb_available_modes = 0;
+-		CHECK_RESULT(vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, m_surface, &nb_available_modes, nullptr));
++		std::vector<VkPresentModeKHR> present_modes;
++		if (vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, m_surface, &nb_available_modes, nullptr) == VK_SUCCESS && nb_available_modes)
++		{
++			present_modes.resize(nb_available_modes);
++			if (vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, m_surface, &nb_available_modes, present_modes.data()) != VK_SUCCESS)
++			{
++				present_modes.clear();
++			}
++		}
+ 
+-		std::vector<VkPresentModeKHR> present_modes(nb_available_modes);
+-		CHECK_RESULT(vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, m_surface, &nb_available_modes, present_modes.data()));
++		if (present_modes.empty())
++		{
++			// Same as the capabilities query: fail softly if the surface died.
++			rsx_log.warning("Swapchain: could not enumerate present modes. Deferring swapchain creation.");
++			return false;
++		}
+ 
+ 		VkPresentModeKHR swapchain_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+ 		std::vector<VkPresentModeKHR> preferred_modes;
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/swapchain_core.h b/rpcs3/Emu/RSX/VK/vkutils/swapchain_core.h
+index aaf8426..5771356 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/swapchain_core.h
++++ b/rpcs3/Emu/RSX/VK/vkutils/swapchain_core.h
+@@ -56,6 +56,13 @@ namespace vk
+ 		virtual void destroy(bool full = true) = 0;
+ 		virtual bool init() = 0;
+ 
++		// Surface replacement after surface loss. Some WMs (Android) destroy the
++		// native window of a backgrounded application; the VkSurfaceKHR created
++		// on it is then permanently lost and a replacement must be adopted before
++		// the swapchain can be rebuilt. No-ops for surfaceless implementations.
++		virtual void drop_surface() {}
++		virtual void set_surface(VkSurfaceKHR) {}
++
+ 		virtual u32 get_swap_image_count() const = 0;
+ 		virtual VkImage get_image(u32 index) = 0;
+ 		virtual VkResult acquire_next_swapchain_image(VkSemaphore semaphore, u64 timeout, u32* result) = 0;
+@@ -189,6 +196,24 @@ namespace vk
+ 
+ 		void destroy(bool = true) override;
+ 
++		// The swapchain is destroyed with the surface: it references the dead
++		// surface and cannot serve as oldSwapchain for the replacement.
++		void drop_surface() override
++		{
++			if (m_vk_swapchain)
++			{
++				_vkDestroySwapchainKHR(dev, m_vk_swapchain, nullptr);
++				m_vk_swapchain = VK_NULL_HANDLE;
++			}
++
++			m_surface = VK_NULL_HANDLE;
++		}
++
++		void set_surface(VkSurfaceKHR surface) override
++		{
++			m_surface = surface;
++		}
++
+ 		std::pair<VkSurfaceCapabilitiesKHR, bool> init_surface_capabilities();
+ 
+ 		using WSI_swapchain_base::init;

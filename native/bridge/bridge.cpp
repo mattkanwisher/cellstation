@@ -236,6 +236,15 @@ namespace
 	// ---- surface state -----------------------------------------------------
 	atomic_t<ANativeWindow*> g_native_window{nullptr};
 
+	// Windows retired by surfaceEvent, kept alive for two more surface events
+	// before release. The RSX thread reads g_native_window without a lock and
+	// may still be presenting to a pointer it loaded just before the swap; a
+	// window whose buffers are gone is safe to hold (Vulkan reports
+	// SURFACE_LOST against it, which the renderer treats as "pause and
+	// rebuild"), a freed one is a use-after-free. Only touched from the UI
+	// thread, which serializes surface callbacks.
+	ANativeWindow* g_retired_windows[2]{};
+
 	// ---- ADPF (Android Dynamic Performance Framework) ----------------------
 	//
 	// The power HAL cannot distinguish a latency-sensitive workload from a
@@ -468,18 +477,22 @@ namespace
 		void set_current(draw_context_t) override {}
 		void flip(draw_context_t, bool /*skip_frame*/) override { adpf::on_flip(); }
 
+		// A zero client area is upstream's "window is gone" signal (a minimized
+		// window on desktop): VKGSRender parks presentation on it instead of
+		// trying to rebuild a swapchain against nothing. Report it honestly
+		// while backgrounded rather than a made-up 1280x720.
 		int client_width() override
 		{
 			if (ANativeWindow* w = g_native_window)
 				return ANativeWindow_getWidth(w);
-			return 1280;
+			return 0;
 		}
 
 		int client_height() override
 		{
 			if (ANativeWindow* w = g_native_window)
 				return ANativeWindow_getHeight(w);
-			return 720;
+			return 0;
 		}
 
 		f64 client_display_rate() override { return 60.; }
@@ -1455,17 +1468,18 @@ JNIEXPORT void JNICALL Java_nu_hyperworks_cellstation_EmuBridge_setStretchToDisp
 
 JNIEXPORT jboolean JNICALL Java_nu_hyperworks_cellstation_EmuBridge_surfaceEvent(JNIEnv* env, jclass, jobject surface, jint event)
 {
+	ANativeWindow* incoming = nullptr;
 	if (event == 0 /* ready */ && surface)
-	{
-		ANativeWindow* w = ANativeWindow_fromSurface(env, surface);
-		if (ANativeWindow* old = g_native_window.exchange(w))
-			ANativeWindow_release(old);
-		return JNI_TRUE;
-	}
+		incoming = ANativeWindow_fromSurface(env, surface);
 
-	// destroyed
-	if (ANativeWindow* old = g_native_window.exchange(nullptr))
-		ANativeWindow_release(old);
+	// Retire the outgoing window instead of releasing it here: the RSX thread
+	// may still hold the raw pointer (see g_retired_windows).
+	ANativeWindow* outgoing = g_native_window.exchange(incoming);
+	if (g_retired_windows[1])
+		ANativeWindow_release(g_retired_windows[1]);
+	g_retired_windows[1] = g_retired_windows[0];
+	g_retired_windows[0] = outgoing;
+
 	return JNI_TRUE;
 }
 

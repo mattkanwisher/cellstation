@@ -16,3 +16,4 @@
 0015-overlay-fonts-android-system-fonts.patch
 0016-vk-unknown-gpu-safe-transport.patch
 0017-android-big-core-affinity.patch
+0018-vk-surface-lost-recovery.patch
