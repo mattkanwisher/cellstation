@@ -1,0 +1,352 @@
+Subject: SPURS HLE: revive the dormant SPU-side scheduler via stop-code interception
+Why: on the 8-core Snapdragon target, the SPURS kernel's GETLLAR polling and the
+reservation contention it generates cost ~a quarter of all CPU cycles (measured
+on DOA5U, docs/RESEARCH-ai-optimization.md). cellSpursSpu.cpp still contains a
+full HLE of kernel1/kernel2, the system-service workload and the taskset PM, but
+the RegisterHleFunction divert mechanism it needed was removed years ago. This
+reintroduces interception as reserved SPU stop codes (0x3F80-0x3F85) written
+into LS at the kernel's fixed entry addresses when a recognized kernel image is
+deployed, gated behind the new default-off "SPURS HLE (experimental)" flag and a
+per-build SHA1 whitelist (currently DOA5U's kernel). Also fixes three bugs in
+the dormant code required for games that link the real libsre (whose policy
+modules run as guest code against the HLE kernel): the system-service idle
+handler read a never-refreshed LS mirror of the SPURS structure; the select-
+workload read-modify-write was not atomic against the modules' GETLLAR/PUTLLC;
+and unconditional publishes starved the modules' PUTLLCs (now publishes, and
+notifies reservation waiters, only when the lock line actually changed).
+Status: WIP experiment with rate-limited diagnostics left in. DOA5U: HLE kernel
+schedules the game's real workloads and the frame loop reaches ~42 fps, then
+stalls; the system SPURS instance re-dispatches its audio job chain at ~190 Hz
+(suspect: kernel2 ready-count consumption semantics). Not yet playable.
+Upstream-status: not submitted (needs per-SDK-hash validation + the above)
+--- a/rpcs3/Emu/system_config.h
++++ b/rpcs3/Emu/system_config.h
+@@ -48,6 +48,7 @@
+ 		cfg::_int<0, 16> spu_delay_penalty{ this, "SPU delay penalty", 3 }; // Number of milliseconds to block a thread if a virtual 'core' isn't free
+ 		cfg::_bool spu_loop_detection{ this, "SPU loop detection", false }; // Try to detect wait loops and trigger thread yield
+ 		cfg::_int<1, 6> max_spurs_threads{ this, "Max SPURS Threads", 6, true }; // HACK. If less then 6, max number of running SPURS threads in each thread group.
++		cfg::_bool spurs_hle{ this, "SPURS HLE (experimental)", false }; // Divert known SPURS kernel images to the HLE scheduler in cellSpursSpu.cpp
+ 		cfg::_enum<spu_block_size_type> spu_block_size{ this, "SPU Block Size", spu_block_size_type::safe };
+ 		cfg::_bool spu_accurate_dma{ this, "Accurate SPU DMA", false };
+ 		cfg::_bool spu_accurate_reservations{ this, "Accurate SPU Reservations", true };
+--- a/rpcs3/Emu/Cell/Modules/cellSpurs.h
++++ b/rpcs3/Emu/Cell/Modules/cellSpurs.h
+@@ -119,6 +119,31 @@
+ 	CELL_SPURS_KERNEL2_SELECT_WORKLOAD_ADDR = 0x290,
+ };
+ 
++// SPURS HLE (see cellSpursSpu.cpp): reserved SPU stop codes written into local
++// storage at the kernel/policy-module entry points of a recognized SPURS kernel
++// image, diverting execution to the HLE scheduler. Top of the 14-bit stop-code
++// space; no SDK uses these.
++enum SpursHleStopCodes : u32
++{
++	SPURS_HLE_STOP_KERNEL_ENTRY    = 0x3F80,
++	SPURS_HLE_STOP_WORKLOAD_EXIT   = 0x3F81,
++	SPURS_HLE_STOP_SELECT_WORKLOAD = 0x3F82,
++	SPURS_HLE_STOP_SYS_SRV_ENTRY   = 0x3F83,
++	SPURS_HLE_STOP_TASKSET_ENTRY   = 0x3F84,
++	SPURS_HLE_STOP_TASKSET_SYSCALL = 0x3F85,
++};
++
++class spu_thread;
++
++// Dispatch a SPURS HLE stop code (returns the value for stop_and_signal: false = pc was set by the HLE)
++bool spursHleStop(spu_thread& spu, u32 code);
++
++// Write the kernel-entry stop opcodes into a freshly deployed SPURS kernel image (called from sys_spu_image::deploy)
++void spursHleArmKernel(u8* ls);
++
++// Whether this SPU image hash is a SPURS kernel build whose LS layout matches the HLE ("SPU-<sha1>" format)
++bool spursHleKnownKernel(const std::string& hash);
++
+ enum RangeofEventQueuePortNumbers
+ {
+ 	CELL_SPURS_STATIC_PORT_RANGE_BOTTOM  = 15,
+--- a/rpcs3/Emu/Cell/Modules/cellSpursSpu.cpp
++++ b/rpcs3/Emu/Cell/Modules/cellSpursSpu.cpp
+@@ -22,6 +22,11 @@
+ //----------------------------------------------------------------------------
+ 
+ //
++// SPURS HLE interception (see SpursHleStopCodes in cellSpurs.h)
++//
++static void spursHleWriteStop(u8* ls, u32 lsa, u32 code);
++
++//
+ // SPURS utility functions
+ //
+ static void cellSpursModulePutTrace(CellSpursTracePacket* packet, u32 dmaTagId);
+@@ -82,7 +87,85 @@
+ //
+ bool spursJobChainEntry(spu_thread& spu);
+ void spursJobchainPopUrgentCommand(spu_thread& spu);
++
++//----------------------------------------------------------------------------
++// SPURS HLE interception
++//----------------------------------------------------------------------------
++
++// A stop-and-signal instruction: opcode 0 in the top bits, 14-bit signal code
++static void spursHleWriteStop(u8* ls, u32 lsa, u32 code)
++{
++	*reinterpret_cast<be_t<u32>*>(ls + lsa) = code & 0x3FFF;
++}
++
++// Raw view of the SPURS kernel lock line (first 128 bytes of CellSpurs) for
++// vm::reservation_op: the real policy modules running as guest code update the
++// same line with GETLLAR/PUTLLC, so the HLE scheduler's read-modify-writes must
++// be atomic against them and must notify reservation waiters (Ack) or modules
++// blocked on lock-line-lost events never wake.
++struct alignas(128) spurs_hle_lock_line { u8 raw[128]; };
++
++bool spursHleKnownKernel(const std::string& hash)
++{
++	// SPURS kernel builds whose LS layout matches this HLE (kernel entry at
++	// 0x818/0x848, exit at 0x808/0x838, select-workload at 0x290, policy
++	// modules loaded at 0xA00). Add hashes only after verifying the layout.
++	return hash == "SPU-756df5d819d66f930a0c4e18c72a0e9972fa45fa";
++}
++
++void spursHleArmKernel(u8* ls)
++{
++	// Divert both kernel generations' entries: the HLE decides at runtime
++	// (flags1 & SF1_32_WORKLOADS) which generation it is dealing with, and the
++	// kernel region never executes anything else once every entry into it is
++	// intercepted.
++	spursHleWriteStop(ls, CELL_SPURS_KERNEL1_ENTRY_ADDR, SPURS_HLE_STOP_KERNEL_ENTRY);
++	spursHleWriteStop(ls, CELL_SPURS_KERNEL2_ENTRY_ADDR, SPURS_HLE_STOP_KERNEL_ENTRY);
++	spursHleWriteStop(ls, CELL_SPURS_KERNEL1_EXIT_ADDR, SPURS_HLE_STOP_WORKLOAD_EXIT);
++	spursHleWriteStop(ls, CELL_SPURS_KERNEL2_EXIT_ADDR, SPURS_HLE_STOP_WORKLOAD_EXIT);
++	spursHleWriteStop(ls, CELL_SPURS_KERNEL1_SELECT_WORKLOAD_ADDR, SPURS_HLE_STOP_SELECT_WORKLOAD);
++}
++
++bool spursHleStop(spu_thread& spu, u32 code)
++{
++	// Trace: first hit of each code, then every 4096th (temporary diagnostics)
++	{
++		static atomic_t<u32> s_hits[8]{};
++		const u32 n = s_hits[code & 7]++;
++		if (n == 0 || !(n & 4095))
++		{
++			cellSpurs.warning("spursHleStop: code=0x%x hits=%u pc=0x%x lr=0x%x spu=%s", code, n + 1, spu.pc, spu.gpr[0]._u32[3], spu.get_name());
++		}
++	}
++
++	bool to_lr = false;
++
++	switch (code)
++	{
++	case SPURS_HLE_STOP_KERNEL_ENTRY: to_lr = spursKernelEntry(spu); break;
++	case SPURS_HLE_STOP_WORKLOAD_EXIT: to_lr = spursKernelWorkloadExit(spu); break;
++	case SPURS_HLE_STOP_SELECT_WORKLOAD:
++	{
++		const auto ctxt = spu._ptr<SpursKernelContext>(0x100);
++		to_lr = ctxt->spurs->flags1 & SF1_32_WORKLOADS ? spursKernel2SelectWorkload(spu) : spursKernel1SelectWorkload(spu);
++		break;
++	}
++	case SPURS_HLE_STOP_SYS_SRV_ENTRY: to_lr = spursSysServiceEntry(spu); break;
++	case SPURS_HLE_STOP_TASKSET_ENTRY: to_lr = spursTasksetEntry(spu); break;
++	case SPURS_HLE_STOP_TASKSET_SYSCALL: to_lr = spursTasksetSyscallEntry(spu); break;
++	default: fmt::throw_exception("spursHleStop: unknown code 0x%x", code);
++	}
++
++	if (to_lr)
++	{
++		// The HLE routine behaved as a call: return to the guest caller
++		spu.pc = spu.gpr[0]._u32[3] & 0x3FFFC;
++	}
+ 
++	// spu.pc holds the next guest address in either case; never fall through the stop
++	return false;
++}
++
+ //----------------------------------------------------------------------------
+ // SPURS utility functions
+ //----------------------------------------------------------------------------
+@@ -270,9 +353,16 @@
+ 	u32 wklSelectedId;
+ 	u32 pollStatus;
+ 
+-	//vm::reservation_op(vm::cast(ctxt->spurs.addr()), 128, [&]()
++	vm::reservation_op<true>(spu, vm::unsafe_ptr_cast<spurs_hle_lock_line>(ctxt->spurs), [&](spurs_hle_lock_line& line) -> bool
+ 	{
+-		// lock the first 0x80 bytes of spurs
++		// lock the first 0x80 bytes of spurs (the op holds the line; keep the
++		// field accesses through the regular pointer). Publish — and thereby
++		// invalidate the guest modules' GETLLAR reservations — only when the
++		// line actually changed, or the modules' own PUTLLCs get starved by
++		// polling selects and can never mark themselves idle.
++		u8 snapshot[128];
++		std::memcpy(snapshot, line.raw, 128);
++
+ 		auto spurs = ctxt->spurs.get_ptr();
+ 
+ 		// Calculate the contention (number of SPUs used) for each workload
+@@ -433,7 +523,8 @@
+ 		}
+ 
+ 		std::memcpy(ctxt, spurs, 128);
+-	}//);
++		return std::memcmp(snapshot, line.raw, 128) != 0;
++	});
+ 
+ 	u64 result = u64{wklSelectedId} << 32;
+ 	result |= pollStatus;
+@@ -454,9 +545,12 @@
+ 	u32 wklSelectedId;
+ 	u32 pollStatus;
+ 
+-	//vm::reservation_op(vm::cast(ctxt->spurs.addr()), 128, [&]()
++	vm::reservation_op<true>(spu, vm::unsafe_ptr_cast<spurs_hle_lock_line>(ctxt->spurs), [&](spurs_hle_lock_line& line) -> bool
+ 	{
+-		// lock the first 0x80 bytes of spurs
++		// See spursKernel1SelectWorkload: publish only when the line changed
++		u8 snapshot[128];
++		std::memcpy(snapshot, line.raw, 128);
++
+ 		auto spurs = ctxt->spurs.get_ptr();
+ 
+ 		// Calculate the contention (number of SPUs used) for each workload
+@@ -606,7 +700,8 @@
+ 		}
+ 
+ 		std::memcpy(ctxt, spurs, 128);
+-	}//);
++		return std::memcmp(snapshot, line.raw, 128) != 0;
++	});
+ 
+ 	u64 result = u64{wklSelectedId} << 32;
+ 	result |= pollStatus;
+@@ -631,16 +726,27 @@
+ 	const auto wklInfo = spu._ptr<CellSpurs::WorkloadInfo>(0x3FFE0);
+ 	std::memcpy(wklInfo, wklInfoOffset, 0x20);
+ 
++	// Trace dispatch decisions (temporary diagnostics)
++	{
++		static atomic_t<u32> s_disp{};
++		const u32 n = s_disp++;
++		if (n < 32 || !(n & 4095))
++		{
++			cellSpurs.warning("SPURS HLE dispatch[%u]: spu=%u wid=%u addr=0x%x size=0x%x cur=0x%x k2=%d", n, ctxt->spuNum, wid, wklInfo->addr.addr(), +wklInfo->size, ctxt->wklCurrentAddr.addr(), isKernel2);
++		}
++	}
++
+ 	// Load the workload to LS
+ 	if (ctxt->wklCurrentAddr != wklInfo->addr)
+ 	{
+ 		switch (wklInfo->addr.addr())
+ 		{
+ 		case SPURS_IMG_ADDR_SYS_SRV_WORKLOAD:
+-			//spu.RegisterHleFunction(0xA00, spursSysServiceEntry);
++			spursHleWriteStop(spu._ptr<u8>(0), CELL_SPURS_TASKSET_PM_ENTRY_ADDR, SPURS_HLE_STOP_SYS_SRV_ENTRY);
+ 			break;
+ 		case SPURS_IMG_ADDR_TASKSET_PM:
+-			//spu.RegisterHleFunction(0xA00, spursTasksetEntry);
++			spursHleWriteStop(spu._ptr<u8>(0), CELL_SPURS_TASKSET_PM_ENTRY_ADDR, SPURS_HLE_STOP_TASKSET_ENTRY);
++			spursHleWriteStop(spu._ptr<u8>(0), CELL_SPURS_TASKSET_PM_SYSCALL_ADDR, SPURS_HLE_STOP_TASKSET_SYSCALL);
+ 			break;
+ 		default:
+ 			std::memcpy(spu._ptr<void>(0xA00), wklInfo->addr.get_ptr(), wklInfo->size);
+@@ -768,7 +874,12 @@
+ 
+ 	while (true)
+ 	{
+-		const auto spurs = spu._ptr<CellSpurs>(0x100);
++		// Read the live SPURS structure in main memory, not the stale LS mirror
++		// at 0x100: the LLE kernel refreshed that mirror with a GETLLAR on every
++		// poll (the commented reservation_acquire below), so reading the mirror
++		// here would never observe workloads added after the SPUs went idle —
++		// and the spuIdling updates below must be visible to the other SPUs.
++		const auto spurs = ctxt->spurs;
+ 		//vm::reservation_acquire(ctxt->spurs.addr());
+ 
+ 		// Find the number of SPUs that are idling in this SPURS instance
+@@ -852,6 +963,21 @@
+ 		// If all SPUs are idling and the exit_if_no_work flag is set then the SPU thread group must exit. Otherwise wait for external events.
+ 		if (spuIdling && shouldExit == false && foundReadyWorkload == false)
+ 		{
++			// Trace the scheduling inputs while idle (temporary diagnostics)
++			{
++				static atomic_t<u32> s_idle_iters{};
++				const u32 n = s_idle_iters++;
++				if (n == 0 || !(n & 2047))
++				{
++					cellSpurs.warning("SPURS HLE idle[%u]: spu=%u msg=0x%x runnable1=0x%x signal1=0x%x flag_rcv=%u ready1[0-3]=%u,%u,%u,%u maxcont[0-3]=0x%x,0x%x,0x%x,0x%x curcont[0-3]=0x%x,0x%x,0x%x,0x%x flags1=0x%x",
++						n, ctxt->spuNum, +spurs->sysSrvMessage, ctxt->wklRunnable1, +spurs->wklSignal1, +spurs->wklFlagReceiver,
++						+spurs->wklReadyCount1[0], +spurs->wklReadyCount1[1], +spurs->wklReadyCount1[2], +spurs->wklReadyCount1[3],
++						+spurs->wklMaxContention[0], +spurs->wklMaxContention[1], +spurs->wklMaxContention[2], +spurs->wklMaxContention[3],
++						+spurs->wklCurrentContention[0], +spurs->wklCurrentContention[1], +spurs->wklCurrentContention[2], +spurs->wklCurrentContention[3],
++						+spurs->flags1);
++				}
++			}
++
+ 			// The system service blocks by making a reservation and waiting on the lock line reservation lost event.
+ 			thread_ctrl::wait_for(1000);
+ 			continue;
+@@ -1026,7 +1152,9 @@
+ // Activate a workload
+ void spursSysServiceActivateWorkload(spu_thread& spu, SpursKernelContext* ctxt)
+ {
+-	const auto spurs = spu._ptr<CellSpurs>(0x100);
++	// Live structure, not the stale LS mirror (see spursSysServiceIdleHandler)
++	const auto spurs = ctxt->spurs;
++	cellSpurs.warning("SPURS HLE: activate workloads on spu=%u", ctxt->spuNum);
+ 	std::memcpy(spu._ptr<void>(0x30000), ctxt->spurs->wklInfo1, 0x200);
+ 	if (spurs->flags1 & SF1_32_WORKLOADS)
+ 	{
+--- a/rpcs3/Emu/Cell/lv2/sys_spu.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_spu.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include "Emu/Cell/ErrorCodes.h"
+ #include "Emu/Cell/PPUThread.h"
++#include "Emu/Cell/Modules/cellSpurs.h"
++#include "Emu/system_config.h"
+ #include "Emu/Cell/timers.hpp"
+ #include "Emu/Memory/vm_reservation.h"
+ #include "sys_interrupt.h"
+@@ -224,6 +226,15 @@
+ 		g_fxo->get<patch_engine>().apply(applied, Emu.GetTitleID() + '-' + hash, mem_translate);
+ 	}
+ 
++	// SPURS HLE: a recognized SPURS kernel image gets its entry points diverted
++	// to the HLE scheduler right after deployment (re-applied on every group
++	// start, which redeploys the image).
++	if (g_cfg.core.spurs_hle && spursHleKnownKernel(hash))
++	{
++		spursHleArmKernel(loc);
++		spu_log.success("SPURS HLE: diverting kernel image %s", hash);
++	}
++
+ 	(is_verbose ? spu_log.notice : sys_spu.trace)("Loaded SPU image: %s (<- %u)%s", hash, applied.size(), dump);
+ }
+ 
+--- a/rpcs3/Emu/Cell/SPUThread.cpp
++++ b/rpcs3/Emu/Cell/SPUThread.cpp
+@@ -16,6 +16,7 @@
+ #include "Emu/Cell/lv2/sys_event_flag.h"
+ #include "Emu/Cell/lv2/sys_event.h"
+ #include "Emu/Cell/lv2/sys_interrupt.h"
++#include "Emu/Cell/Modules/cellSpurs.h"
+ 
+ #include "Emu/Cell/SPUDisAsm.h"
+ #include "Emu/Cell/SPUAnalyser.h"
+@@ -6539,6 +6540,18 @@
+ 
+ 	switch (code)
+ 	{
++	case SPURS_HLE_STOP_KERNEL_ENTRY:
++	case SPURS_HLE_STOP_WORKLOAD_EXIT:
++	case SPURS_HLE_STOP_SELECT_WORKLOAD:
++	case SPURS_HLE_STOP_SYS_SRV_ENTRY:
++	case SPURS_HLE_STOP_TASKSET_ENTRY:
++	case SPURS_HLE_STOP_TASKSET_SYSCALL:
++	{
++		// Reserved stop codes only ever written into LS by the SPURS HLE
++		// (cellSpursSpu.cpp); the handler sets pc to the next guest address.
++		return spursHleStop(*this, code);
++	}
++
+ 	case 0x001:
+ 	{
+ 		state += cpu_flag::wait;

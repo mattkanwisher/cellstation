@@ -118,3 +118,14 @@ Use `git -C rpcs3 checkout -- . && git -C rpcs3 clean -fd` to reset the submodul
     symbol announcement for debuggers). Measured on a heavy disc title:
     VmSize climbed 82 → 125 GiB and aborted; with this patch it stays flat
     at ~78 GiB and the compile completes. Upstream-status: candidate.
+17. `0019-spurs-kernel-hle-revival.patch` — revive the dormant SPU-side SPURS
+    scheduler HLE (`cellSpursSpu.cpp`) behind a default-off
+    `SPURS HLE (experimental)` flag: a recognized kernel image (SHA1
+    whitelist; currently DOA5U's) gets reserved stop codes written at its
+    entry/exit/select addresses at deploy time, diverting the scheduler to
+    host code while real policy modules keep running as guest code. Includes
+    three fixes the dormant code needed for real-libsre titles (stale LS
+    mirror in the idle handler; select made atomic against module
+    GETLLAR/PUTLLC via `vm::reservation_op`; publish/notify only on actual
+    line change). WIP: DOA5U schedules and reaches ~42 fps then stalls.
+    Upstream-status: local-only (experiment).
