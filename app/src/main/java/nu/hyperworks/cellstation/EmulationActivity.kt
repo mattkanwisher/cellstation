@@ -50,6 +50,7 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
      * tools/drive.sh), which makes headless measurement runs impossible without it.
      */
     private var debugPadReceiver: android.content.BroadcastReceiver? = null
+    @Volatile private var padAssigned = false
 
     private fun registerDebugPad() {
         if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0) return
@@ -69,7 +70,19 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
                 val keys = intent?.getStringExtra("keys")?.split(',') ?: return
                 val hold = intent.getIntExtra("hold", 250).toLong()
                 val gap = intent.getIntExtra("gap", 3000).toLong()
+                android.util.Log.e("RPCS3", "PAD-RECV: keys=$keys hold=$hold gap=$gap overlay=${overlay != null}")
                 Thread {
+                    // Force a fresh connect transition so a controller-assign gate
+                    // (e.g. DOA5's "PRESS START") accepts injected input the same way
+                    // it accepts the first physical press. Harmless once past such a
+                    // screen. Only needed once, but cheap to repeat.
+                    if (!padAssigned) {
+                        EmuBridge.setPadConnected(false)
+                        Thread.sleep(250)
+                        EmuBridge.setPadConnected(true)
+                        Thread.sleep(250)
+                        padAssigned = true
+                    }
                     for (raw in keys) {
                         val idx = names[raw.trim().lowercase()] ?: continue
                         pad.setVirtual(idx, true)
