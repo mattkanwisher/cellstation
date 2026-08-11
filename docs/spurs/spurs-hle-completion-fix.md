@@ -211,3 +211,30 @@ next iteration is targeted rather than speculative.
   `vm::reservation_op<Ack=true>`, publish-on-change).
 - Ready-count quads: the real kernel2 never writes them; the HLE select doesn't
   either.
+
+## On-device test result (2026-08-12) — fix inert, but diagnostics pinned the queue
+
+Built + tested on the Thor with SPURS HLE on. HLE engages, both instances
+schedule (~30 dispatches in the first second), then the MAIN instance
+(spurs=0x24d9980) goes silent at ~1s while only the audio instance
+(0x24dba00) heartbeats — the SAME ~1s stall. Game frozen: FPS ~5, SPU 0.0%,
+black screen.
+
+**The workload-shutdown completion send fired 0 times** — so the filled-in
+`sys_spu_thread_send_event` on the shutdown path is inert for THIS stall; the
+missing completion is a PER-FRAME job path, not workload teardown (the agent's
+"if it redirects" case).
+
+**The event-queue diagnostics pinned the starving queue precisely:**
+- `KtslMsUpdater` (the game's MultiStream/engine updater) blocks FOREVER
+  (timeout=0) on **equeue_id=0x8d01d300** — the prime starving queue.
+- `_gcm_intr_thread` waits on 0x8d01a800 (RSX interrupt — likely normal vblank wait).
+- `KtslAudioPort` on 0x8d01d100 has a 100ms timeout (not truly stuck).
+
+**Next lead (task #8):** the HLE must signal 0x8d01d300 when the game's
+per-frame workloads/jobs complete. Trace who sends to 0x8d01d300 under stock
+(HLE-off): it's the SPURS event the taskset/job-chain PM (or the kernel's
+per-workload event-flag/port path) raises on job completion — NOT the
+workload-shutdown path. Implement that send in the HLE's per-workload
+completion, keyed to the port the game registered (the diag already logs the
+equeue_id; add the matching port_send side to find who raises it under LLE).
