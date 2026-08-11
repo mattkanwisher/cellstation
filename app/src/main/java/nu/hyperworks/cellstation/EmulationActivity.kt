@@ -41,6 +41,51 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private lateinit var frame: FrameLayout
     private var quickPanel: LinearLayout? = null
 
+    /**
+     * Debug-only remote pad: `adb shell am broadcast -a nu.hyperworks.cellstation.DEBUG_PAD
+     * --es keys "start,start,cross" --ei hold 250 --ei gap 3000` presses buttons through
+     * [PadState.setVirtual] — the same path as the touch overlay, straight into the native
+     * pad snapshot. Exists because injected evdev/keyevent input reaches the activity but
+     * games ignore it until a physical press has occurred (cause still unknown; see
+     * tools/drive.sh), which makes headless measurement runs impossible without it.
+     */
+    private var debugPadReceiver: android.content.BroadcastReceiver? = null
+
+    private fun registerDebugPad() {
+        if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0) return
+        val names = mapOf(
+            "cross" to PadState.Btn.CROSS, "x" to PadState.Btn.CROSS,
+            "circle" to PadState.Btn.CIRCLE, "o" to PadState.Btn.CIRCLE,
+            "square" to PadState.Btn.SQUARE, "triangle" to PadState.Btn.TRIANGLE,
+            "start" to PadState.Btn.START, "select" to PadState.Btn.SELECT,
+            "up" to PadState.Btn.UP, "down" to PadState.Btn.DOWN,
+            "left" to PadState.Btn.LEFT, "right" to PadState.Btn.RIGHT,
+            "l1" to PadState.Btn.L1, "r1" to PadState.Btn.R1,
+            "l2" to PadState.Btn.L2, "r2" to PadState.Btn.R2,
+            "l3" to PadState.Btn.L3, "r3" to PadState.Btn.R3, "ps" to PadState.Btn.PS,
+        )
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
+                val keys = intent?.getStringExtra("keys")?.split(',') ?: return
+                val hold = intent.getIntExtra("hold", 250).toLong()
+                val gap = intent.getIntExtra("gap", 3000).toLong()
+                Thread {
+                    for (raw in keys) {
+                        val idx = names[raw.trim().lowercase()] ?: continue
+                        pad.setVirtual(idx, true)
+                        Thread.sleep(hold)
+                        pad.setVirtual(idx, false)
+                        Thread.sleep(gap)
+                    }
+                }.start()
+            }
+        }
+        androidx.core.content.ContextCompat.registerReceiver(
+            this, receiver, android.content.IntentFilter("nu.hyperworks.cellstation.DEBUG_PAD"),
+            androidx.core.content.ContextCompat.RECEIVER_EXPORTED)
+        debugPadReceiver = receiver
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -76,6 +121,7 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
         setContentView(frame)
         surfaceView.holder.addCallback(this)
+        registerDebugPad()
 
         WindowInsetsControllerCompat(window, surfaceView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
@@ -326,6 +372,8 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     override fun onDestroy() {
+        debugPadReceiver?.let { runCatching { unregisterReceiver(it) } }
+        debugPadReceiver = null
         EmulationService.stop(this)
         EmuBridge.kill()
         super.onDestroy()
