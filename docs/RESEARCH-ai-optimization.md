@@ -4,7 +4,7 @@ Session notes from an investigation into whether AI-driven techniques can make
 the emulator less CPU-intensive on the Snapdragon targets. Four questions were
 worked through, grounded in `docs/PROFILE-doa5.md` and `docs/BENCHMARKS.md` and
 in the rpcs3 submodule source (pinned `652cf60`). One deliverable shipped:
-flame-graph tooling with JIT symbolization (`docs/FLAMEGRAPHS.md`, patch 0018).
+flame-graph tooling with JIT symbolization (`docs/FLAMEGRAPHS.md`, patch 0019).
 
 ## 1. "Decompile to C++ + AI intent rewrite" instead of dynamic recompilation
 
@@ -170,7 +170,7 @@ real; cooldown gates + repeated runs, or the optimizer overfits to throttling.
 The blocker for all profiling above was the 58.3% anonymous-JIT blob. Fixed —
 see `docs/FLAMEGRAPHS.md` for the workflow. Commit `e2e3c81`:
 
-- **Patch 0018** (`patches/0018-jit-perf-map-export.patch`): resurrects the
+- **Patch 0019** (`patches/0019-jit-perf-map-export.patch`): resurrects the
   `#if 0` perf-map writer in `Utilities/JITASM.cpp` behind `RPCS3_PERF_MAP_DIR`
   — `jit_announce()` already sees every JIT'd function's address/size/name
   (`JITLLVM.cpp:214`, `SPUASMJITRecompiler.cpp:900`). Env re-checked while
@@ -193,7 +193,7 @@ see `docs/FLAMEGRAPHS.md` for the workflow. Commit `e2e3c81`:
 
 1. `Max SPURS Threads` 6/5/4/3 A/B on DOA5 attract mode (config only, ~an hour
    with existing methodology).
-2. First on-device flame-graph capture (validates patch 0018 + tooling, and
+2. First on-device flame-graph capture (validates patch 0019 + tooling, and
    measures X = SPURS-kernel share of guest cycles in the same session).
 3. `spu_prof` run as cross-check on X.
 4. Decide on SPURS HLE investment from (1)-(3): any positive movement in (1)

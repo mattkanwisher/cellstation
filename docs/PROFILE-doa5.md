@@ -122,3 +122,64 @@ same range locks is the structural problem; making the wait cheaper does not hel
 the threads genuinely cannot proceed. Worth investigating next: whether the range-lock
 granularity can be narrowed so the SPUs collide less often, and the 8%-of-emulator-time
 `rsx::FIFO::fetch_u32`. Neither is a small change.
+
+## ADPF performance hints (kept, no measured gain)
+
+Measured on the Forest stage, the same scene as the pre-ADPF baseline of
+**27.8–29.5 avg fps**, with hints active:
+
+| | |
+|---|---|
+| FPS | 30.32 (33.0 ms) |
+| Graph average / 1% low | **27.2** / 21.3 |
+| min / max | 21.3 / 32.1 |
+| Host CPU | 420% (5.3 of 8 cores) |
+| Host GPU | 57% mean over 60 s, 615 MHz |
+
+**No improvement.** 27.2 sits at or just below the baseline band, so the honest
+reading is "no effect", not "a small gain".
+
+Kept anyway, behind a setting that defaults on: the hints are principled, cost
+nothing measurable, and are the only mechanism by which the governor can learn
+that a thread is on a deadline rather than merely busy. But nothing here
+justifies claiming a benefit.
+
+Caveat on rigour: this is a cross-build comparison against the earlier baseline,
+not a same-session A/B. Two attempts at toggling mid-fight failed, both for
+reasons worth recording:
+
+- **SharedPreferences is cached in memory.** Editing `shared_prefs/*.xml` with
+  `run-as` while the app runs does nothing, and would be overwritten on pause.
+  Driving a setting from adb needs a different channel.
+- **Backgrounding the emulator breaks rendering permanently** (see below), so
+  the resume hook that re-applies the setting cannot be reached without losing
+  the scene.
+
+## Where the time actually goes on this device
+
+The host counters settle the CPU-vs-GPU question that the core's own overlay
+cannot answer:
+
+- Host GPU sits at **55–60%** while running at **615 MHz — one step below the
+  680 MHz maximum**, so it is near the top of its range and still half idle.
+- Host CPU runs at **420–470%**, i.e. 5.3–5.9 of 8 cores.
+
+**CPU-bound**, with roughly 40% of GPU capacity unused at near-peak clock.
+
+The sharper observation is the gap between **Guest RSX 94%** and **host GPU
+57%**. The core believes the emulated RSX is nearly saturated while the actual
+Adreno is half idle. That difference is command-stream emulation overhead, not
+drawing — consistent with `rsx::FIFO::fetch_u32` at 8% of emulator time above.
+Work that makes the FIFO cheaper should convert directly into frames; work that
+makes drawing cheaper has nothing to win.
+
+## Two bugs found while measuring
+
+1. **First physical button press was swallowed** — retiring the touch overlay
+   called `PadState.releaseAll()`, zeroing the shared pad state that the very
+   press retiring it had just written. Fixed in 89856af.
+
+2. **Backgrounding and resuming leaves a permanently black screen.** The core
+   keeps running (host CPU ~178%) but the GPU drops to 0.7% and nothing is ever
+   presented again; the render surface is not restored. Open. This is worse
+   than it sounds for normal use: switching apps loses the session.

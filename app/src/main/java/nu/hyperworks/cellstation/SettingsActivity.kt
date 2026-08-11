@@ -236,6 +236,20 @@ class SettingsActivity : AppCompatActivity() {
         )
 
         renderPerfOverlay()
+        renderHostStats()
+
+        row(
+            getString(R.string.row_adpf),
+            getString(R.string.row_adpf_sub),
+            Ui.segmented(
+                this,
+                listOf(getString(R.string.opt_off), getString(R.string.opt_on)),
+                if (Settings.adpf(this)) 1 else 0
+            ) { i ->
+                Settings.setAdpf(this, i == 1)
+                EmuBridge.setAdpfEnabled(i == 1)
+            }
+        )
 
         row(
             getString(R.string.row_online_data),
@@ -258,6 +272,21 @@ class SettingsActivity : AppCompatActivity() {
      * The rest of the controls only appear once the overlay is on, so the pane
      * stays short for the common case of "just show me the frame rate".
      */
+    /**
+     * Host counters are ours, not the core's, so they live next to the core's
+     * overlay rather than inside it — the emulator cannot see host GPU load.
+     */
+    private fun renderHostStats() {
+        val on = Settings.hostStats(this)
+        row(
+            getString(R.string.row_host_stats),
+            getString(R.string.row_host_stats_sub),
+            Ui.segmented(this, listOf(getString(R.string.opt_off), getString(R.string.opt_on)), if (on) 1 else 0) { i ->
+                Settings.setHostStats(this, i == 1)
+            }
+        )
+    }
+
     private fun renderPerfOverlay() {
         perfOverlayChoice(
             EmuBridge.PERF_ENABLED,

@@ -6,7 +6,7 @@ flame graph of that data is one giant `unknown` tower exactly where the answers
 are. This page is the workflow that fixes it.
 
 The core announces every JIT'd function (address, size, name) through
-`jit_announce()`. Patch `0018-jit-perf-map-export.patch` makes it write those
+`jit_announce()`. Patch `0019-jit-perf-map-export.patch` makes it write those
 announcements as a Linux perf map — `<hex addr> <hex size> <name>` lines in
 `perf-<pid>.map` — whenever `RPCS3_PERF_MAP_DIR` is set. The JNI bridge sets
 that variable when the `debug.cellstation.perfmap` system property is on, so

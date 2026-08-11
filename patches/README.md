@@ -118,7 +118,7 @@ Use `git -C rpcs3 checkout -- . && git -C rpcs3 clean -fd` to reset the submodul
     symbol announcement for debuggers). Measured on a heavy disc title:
     VmSize climbed 82 → 125 GiB and aborted; with this patch it stays flat
     at ~78 GiB and the compile completes. Upstream-status: candidate.
-17. `0019-spurs-kernel-hle-revival.patch` — revive the dormant SPU-side SPURS
+18. `0020-spurs-kernel-hle-revival.patch` — revive the dormant SPU-side SPURS
     scheduler HLE (`cellSpursSpu.cpp`) behind a default-off
     `SPURS HLE (experimental)` flag: a recognized kernel image (SHA1
     whitelist; currently DOA5U's) gets reserved stop codes written at its
@@ -129,3 +129,20 @@ Use `git -C rpcs3 checkout -- . && git -C rpcs3 clean -fd` to reset the submodul
     GETLLAR/PUTLLC via `vm::reservation_op`; publish/notify only on actual
     line change). WIP: DOA5U schedules and reaches ~42 fps then stalls.
     Upstream-status: local-only (experiment).
+16. `0016-vk-unknown-gpu-safe-transport.patch` — `chip_class::unknown` is 0,
+    so any GPU whose vendor `get_chip_family()` doesn't recognize (e.g.
+    Adreno) satisfied `gpu_family < chip_class::NV_turing` and took an
+    NVIDIA-only unsafe typeless-transport hack; require a recognized NVIDIA
+    family instead. Upstream-status: candidate.
+17. `0017-android-big-core-affinity.patch` — add `arm_big_little` CPU
+    topology so emulated CPU threads stay off the little cores on Android.
+    Upstream-status: candidate.
+18. `0018-vk-surface-lost-recovery.patch` — Android destroys a backgrounded
+    app's native window and with it the `VkSurfaceKHR`; the RSX thread died
+    in `vk::die_with_error` when `vkAcquireNextImageKHR` returned
+    `VK_ERROR_SURFACE_LOST` (only `OUT_OF_DATE` was handled). Treat surface
+    loss like an out-of-date swapchain — pause presentation, drain flips —
+    and on the next rebuild recreate the surface itself from the new window
+    before the swapchain (ANDROID-gated; desktop windows outlive the
+    renderer). Surface queries inside swapchain init fail softly for the
+    same reason. Upstream-status: candidate.

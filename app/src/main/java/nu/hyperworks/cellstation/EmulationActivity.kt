@@ -44,6 +44,13 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // Ask for a clock ceiling the device can actually hold. Without this the
+        // governor boosts, overheats and then throttles below where it would
+        // have settled — worse for a session than a slightly lower steady state.
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+            runCatching { window.setSustainedPerformanceMode(true) }
+        }
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
         val surfaceView = SurfaceView(this)
@@ -60,6 +67,12 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
         // for minutes with nothing on screen, which is indistinguishable from a
         // hang. Hides itself whenever the core reports no work in progress.
         frame.addView(BootProgressView(this))
+
+        // Host-side counters (CPU vs GPU), which the core's own overlay cannot
+        // report. Off unless asked for; see Settings.
+        if (Settings.hostStats(this)) {
+            frame.addView(HostStatsView(this))
+        }
 
         setContentView(frame)
         surfaceView.holder.addCallback(this)
@@ -214,6 +227,9 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
             EmulationService.start(this, java.io.File(path).nameWithoutExtension)
 
             val stretch = intentBoolean(EXTRA_STRETCH)
+            // Read before boot: the flip path consults this on every frame, so
+            // it is in effect from the first presented frame onward.
+            EmuBridge.setAdpfEnabled(Settings.adpf(this))
             thread(name = "EmuBoot") {
                 val result = EmuBridge.boot(path)
                 if (result != 0) {
@@ -229,6 +245,7 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
                 if (stretch != null) {
                     EmuBridge.setStretchToDisplayArea(stretch, persist = false)
                 }
+
             }
         }
     }
@@ -294,6 +311,10 @@ class EmulationActivity : AppCompatActivity(), SurfaceHolder.Callback {
         // is suspended should take effect on the way back in, without making
         // the player quit and relaunch to find out whether it helped.
         pad.keyMapping = KeyMap.load(this)
+        // Same reasoning for the performance hints, and it makes them testable:
+        // the setting can be re-applied without ending the session, so the same
+        // scene can be measured with and without them.
+        EmuBridge.setAdpfEnabled(Settings.adpf(this))
         EmuBridge.setPadConnected(true)
     }
 
