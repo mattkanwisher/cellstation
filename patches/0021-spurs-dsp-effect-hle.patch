@@ -1,0 +1,362 @@
+Subject: SPU DSP HLE: run DOA5's mstream DSP effects as host C++, not guest SPU
+Why: DOA5U's audio thread (SPU[0x0000200], ~12.7% of all CPU) is dominated by
+the mstream DSP plugin chain (i3dl2 reverb 3.6%, para_eq 0.6%, filter, meter —
+docs/spurs/hle-candidate-survey.md). Patch 0020 shipped a *bypass* of that chain
+(SPURS_HLE_STOP_DSP_BYPASS, dry passthrough) to bound the cost; this replaces the
+bypass with real host implementations so the effects still apply but run in
+native code. It generalizes patch 0020's stop-code interception into a per-effect
+dispatch: each mstream plugin's registration entry is armed (via the parallel
+data patch docs/spurs/audio-stub/patch-hle.yml, same 0x90/0x98 sites the bypass
+used) with one reserved stop code per effect. A registration call self-registers
+a vtable that routes every processing call back to the stop (the ABI captured in
+docs/spurs/dsp-descriptors.txt); a processing call runs the host effect from
+native/spu-hle/dsp_effects.hpp in place over the audio block at the main-memory
+EA in r6 (size r4). The effect kernels (peak/RMS meter, RBJ-cookbook biquad
+filter/EQ, Schroeder/Freeverb I3DL2 reverb) are the *same source* the standalone
+oracle harness (native/spu-hle/oracle) verifies against independent analytic
+references, so what runs in the game is what the oracle checked.
+
+A record mode (SPU DSP HLE record) appends each job's {params, input block,
+output block} to <cache>/spu-dsp-capture.dspcap in the format the oracle reads
+(native/spu-hle/dsp_capture.hpp), for offline replay/verification without the
+device.
+
+Gated behind two default-off flags: "SPU DSP HLE (experimental)" (run the
+effects) and "SPU DSP HLE record" (dump captures). With the run flag off, an
+armed plugin falls through as the existing dry bypass, so arming is harmless.
+
+Known limitations (documented, need a real on-device capture to close):
+ * The audio block format is assumed interleaved stereo f32, 0x3000 bytes; record
+   mode dumps the raw block so this can be confirmed.
+ * filter/para_eq/i3dl2 use documented default parameters — the exact byte
+   offsets of the coefficient/param block inside the descriptor are not yet
+   pinned. The effect *algorithms* are oracle-verified; making them bit-correct
+   against DOA5 needs the descriptor param offsets (record mode captures the
+   descriptor to derive them). The meter needs no params and is complete.
+ * ATRAC (SPU-702a721b) is scaffolded (passthrough) only; it must route to
+   ffmpeg (borrow the cellAdec ATRAC HLE) — a separate later target.
+Depends-on: 0020-spurs-kernel-hle-revival.patch (extends its stop dispatch).
+Upstream-status: local-only (Android/DOA5 experiment).
+diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
+index f29189f..d9487db 100644
+--- a/rpcs3/Emu/CMakeLists.txt
++++ b/rpcs3/Emu/CMakeLists.txt
+@@ -60,6 +60,15 @@ target_include_directories(rpcs3_emu
+         ${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty
+ )
+ 
++# SPU DSP HLE: the host effect kernels + capture format live in the superproject
++# tree (native/spu-hle), shared verbatim with the standalone oracle harness so
++# the emulator runs exactly what the oracle verifies. Layout: <root>/rpcs3 is the
++# submodule, <root>/native its sibling; this Emu dir is <root>/rpcs3/rpcs3/Emu.
++target_include_directories(rpcs3_emu
++    PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/../../../native/spu-hle
++)
++
+ # Utilities
+ target_sources(rpcs3_emu PRIVATE
+     ../util/atomic.cpp
+diff --git a/rpcs3/Emu/Cell/Modules/cellSpurs.h b/rpcs3/Emu/Cell/Modules/cellSpurs.h
+index 34ac4a6..d3201c4 100644
+--- a/rpcs3/Emu/Cell/Modules/cellSpurs.h
++++ b/rpcs3/Emu/Cell/Modules/cellSpurs.h
+@@ -133,6 +133,20 @@ enum SpursHleStopCodes : u32
+ 	SPURS_HLE_STOP_TASKSET_SYSCALL = 0x3F85,
+ 	SPURS_HLE_STOP_DSP_TRACE       = 0x3F86, // log a job descriptor at entry (SPU-HLE pipeline: capture the I/O contract)
+ 	SPURS_HLE_STOP_DSP_BYPASS      = 0x3F87, // mstream DSP plugin bypass: self-registering vtable, all calls return immediately
++
++	// mstream DSP HLE (SPU-HLE pipeline step 5): one reserved stop code per
++	// effect, armed at the plugin's registration entry by docs/spurs/audio-stub/
++	// patch-hle.yml (same arming site the bypass uses, 0x90/0x98). A registration
++	// call (r6 is the small marker 0x2) self-registers a vtable pointing back at
++	// this stop; a processing call (r6 is the main-mem audio EA, r4 the size)
++	// runs the host effect in native/spu-hle/dsp_effects.hpp over the block
++	// in-place. The effect identity is the stop code — no per-plugin address
++	// discovery needed.
++	SPURS_HLE_STOP_DSP_METER       = 0x3F88, // SPU-b5522754  mstream_dsp_meter
++	SPURS_HLE_STOP_DSP_FILTER      = 0x3F89, // SPU-2379c584  mstream_dsp_filter
++	SPURS_HLE_STOP_DSP_PARA_EQ     = 0x3F8A, // SPU-e433af6d  mstream_dsp_para_eq
++	SPURS_HLE_STOP_DSP_I3DL2       = 0x3F8B, // SPU-6783990e  mstream_dsp_i3dl2
++	SPURS_HLE_STOP_DSP_ATRAC       = 0x3F8C, // SPU-702a721b  msngSPURS_ATRAC (scaffold: routes to ffmpeg; not yet implemented)
+ };
+ 
+ class spu_thread;
+diff --git a/rpcs3/Emu/Cell/Modules/cellSpursSpu.cpp b/rpcs3/Emu/Cell/Modules/cellSpursSpu.cpp
+index cfbfd12..5614d39 100644
+--- a/rpcs3/Emu/Cell/Modules/cellSpursSpu.cpp
++++ b/rpcs3/Emu/Cell/Modules/cellSpursSpu.cpp
+@@ -10,6 +10,13 @@
+ #include "util/v128.hpp"
+ #include "util/simd.hpp"
+ 
++#include "Emu/system_config.h"    // g_cfg.core.spu_dsp_hle*
++#include "dsp_effects.hpp"        // native/spu-hle: host effect kernels + capture format (fs::get_cache_dir from stdafx)
++
++#include <map>
++#include <mutex>
++#include <vector>
++
+ LOG_CHANNEL(cellSpurs);
+ 
+ // Temporarily
+@@ -126,6 +133,191 @@ void spursHleArmKernel(u8* ls)
+ 	spursHleWriteStop(ls, CELL_SPURS_KERNEL1_SELECT_WORKLOAD_ADDR, SPURS_HLE_STOP_SELECT_WORKLOAD);
+ }
+ 
++//----------------------------------------------------------------------------
++// mstream DSP effect HLE (SPU-HLE pipeline step 5)
++//
++// The mstream_dsp_* plugins are self-managing SPU jobs: the mixer calls them
++// through a vtable they register into a descriptor; each call GETs its audio
++// block from a main-memory EA, processes it in place, and PUTs it back (see
++// docs/SPU-HLE-PIPELINE.md). We arm each plugin's registration entry with a
++// per-effect reserved stop code (docs/spurs/audio-stub/patch-hle.yml). On a
++// registration call we self-register a vtable that routes every processing call
++// back to the stop; on a processing call we run the host effect from
++// native/spu-hle/dsp_effects.hpp directly over the block at the EA — the same
++// code the standalone oracle (native/spu-hle/oracle) verifies.
++//----------------------------------------------------------------------------
++namespace
++{
++	// DOA5's mstream mix buffers are 0x3000-byte blocks (task-confirmed) at
++	// main-mem EAs. Treated as interleaved stereo 32-bit float; record mode dumps
++	// the raw block so this can be confirmed/adjusted against a real capture.
++	constexpr spu_hle::sample_format kDspFormat = spu_hle::sample_format::f32;
++	constexpr int kDspChannels = 2;
++	constexpr u32 kDspBlockBytes = 0x3000;
++	constexpr u32 kDspSampleRate = 48000;
++
++	// r6 on a registration call is the small marker 0x2; on a processing call it
++	// is the audio buffer's main-memory EA (>= the PS3 user-memory base).
++	inline bool dsp_is_process_call(u32 r6) { return r6 >= 0x10000u; }
++
++	spu_hle::effect_id dsp_effect_of(u32 code)
++	{
++		switch (code)
++		{
++		case SPURS_HLE_STOP_DSP_METER:   return spu_hle::effect_id::meter;
++		case SPURS_HLE_STOP_DSP_FILTER:  return spu_hle::effect_id::filter;
++		case SPURS_HLE_STOP_DSP_PARA_EQ: return spu_hle::effect_id::para_eq;
++		case SPURS_HLE_STOP_DSP_I3DL2:   return spu_hle::effect_id::i3dl2;
++		case SPURS_HLE_STOP_DSP_ATRAC:   return spu_hle::effect_id::atrac;
++		default:                         return spu_hle::effect_id::none;
++		}
++	}
++
++	// Per plugin-instance effect state, keyed by (effect, descriptor EA). The
++	// audio DSP chain runs on one SPU thread, but guard for safety.
++	struct dsp_instance
++	{
++		spu_hle::meter_state  meter;
++		spu_hle::biquad_state biquad;
++		spu_hle::i3dl2_state  reverb;
++	};
++	std::mutex g_dsp_mutex;
++	std::map<u64, dsp_instance> g_dsp_state;
++
++	// Effect parameters. NOTE: the exact byte offsets of the coefficient/param
++	// block inside the descriptor are not yet confirmed against a real capture,
++	// so filter/eq/reverb use documented defaults for now; the meter needs no
++	// params. Record mode captures the descriptor so the offsets can be pinned
++	// offline — that is the one remaining input needed to make filter/eq/reverb
++	// bit-correct (their algorithms are already oracle-verified).
++	void dsp_default_biquad(spu_hle::biquad_params& p)
++	{
++		p.stages = 1;
++		p.coeffs[0] = spu_hle::biquad_lowpass(kDspSampleRate, kDspSampleRate / 4.0, 0.7071);
++	}
++	void dsp_default_i3dl2(spu_hle::i3dl2_params& p)
++	{
++		p = {};
++		p.decay_time = 1.5f; p.decay_hf_ratio = 0.83f; p.diffusion = 100.0f;
++		p.density = 100.0f; p.hf_reference = 5000.0f; p.sample_rate = kDspSampleRate;
++	}
++
++	// Append one capture record for the host oracle (native/spu-hle/oracle).
++	void dsp_record(spu_hle::effect_id id, u32 seq, const void* params, u32 param_bytes,
++		const void* in, const void* out, u32 out_bytes, u32 frames)
++	{
++		static std::mutex m;
++		std::lock_guard lock(m);
++		const std::string path = fs::get_cache_dir() + "spu-dsp-capture.dspcap";
++		const bool existed = fs::is_file(path);
++		fs::file f{path, fs::write + fs::create + fs::append};
++		if (!f) return;
++		if (!existed)
++		{
++			spu_hle::dsp_cap_file_header fh{};
++			std::memcpy(fh.magic, spu_hle::kMagic, 8);
++			fh.version = spu_hle::kVersion;
++			fh.record_count = 0; // streamed; the harness reads until EOF
++			f.write(&fh, sizeof fh);
++		}
++		spu_hle::dsp_cap_record_header h{};
++		h.effect = static_cast<u32>(id);
++		h.format = static_cast<u32>(kDspFormat);
++		h.channels = kDspChannels;
++		h.frames = frames;
++		h.sample_rate = kDspSampleRate;
++		h.param_bytes = param_bytes;
++		h.in_bytes = kDspBlockBytes;
++		h.out_bytes = out_bytes;
++		h.seq = seq;
++		f.write(&h, sizeof h);
++		if (param_bytes) f.write(params, param_bytes);
++		f.write(in, kDspBlockBytes);
++		f.write(out, out_bytes);
++	}
++}
++
++// Run one mstream DSP block in host C++, in place at the audio EA.
++static void spursHleDspProcess(spu_thread& spu, u32 code)
++{
++	const u32 desc = spu.gpr[3]._u32[3];
++	const u32 size = spu.gpr[4]._u32[3];
++	const u32 ea   = spu.gpr[6]._u32[3];
++
++	const u32 bytes = (size && size <= 0x40000) ? size : kDspBlockBytes;
++	const int bytes_per_frame = kDspChannels * (kDspFormat == spu_hle::sample_format::f32 ? 4 : 2);
++	const int frames = static_cast<int>(bytes) / bytes_per_frame;
++
++	u8* audio = vm::_ptr<u8>(ea);
++	if (!audio || frames <= 0) return;
++
++	// The SPU mix buffer is big-endian. Byteswap into a host-order scratch copy,
++	// process there, and byteswap the result back.
++	std::vector<u8> host_in(bytes), host_out(bytes);
++	{
++		const be_t<u32>* src = reinterpret_cast<const be_t<u32>*>(audio);
++		u32* dst = reinterpret_cast<u32*>(host_in.data());
++		for (u32 i = 0; i < bytes / 4; i++) dst[i] = src[i];
++	}
++
++	const spu_hle::effect_id id = dsp_effect_of(code);
++	spu_hle::meter_result meter_out{};
++	u32 out_bytes = bytes;
++	const void* rec_params = nullptr;
++	u32 rec_param_bytes = 0;
++	spu_hle::meter_params  mp{};
++	spu_hle::biquad_params bp{};
++	spu_hle::i3dl2_params  ip{};
++
++	{
++		std::lock_guard lock(g_dsp_mutex);
++		dsp_instance& st = g_dsp_state[(u64(code) << 32) | desc];
++		switch (id)
++		{
++		case spu_hle::effect_id::meter:
++			mp.decay = spu_hle::kMeterDecay;
++			meter_out = spu_hle::meter_process(st.meter, host_in.data(), kDspFormat, kDspChannels, frames, mp);
++			std::memcpy(host_out.data(), host_in.data(), bytes); // meter does not alter audio
++			rec_params = &mp; rec_param_bytes = sizeof mp;
++			out_bytes = sizeof meter_out;
++			break;
++		case spu_hle::effect_id::filter:
++		case spu_hle::effect_id::para_eq:
++			dsp_default_biquad(bp);
++			spu_hle::biquad_process(st.biquad, bp, host_in.data(), host_out.data(), kDspFormat, kDspChannels, frames);
++			rec_params = &bp; rec_param_bytes = sizeof bp;
++			break;
++		case spu_hle::effect_id::i3dl2:
++			dsp_default_i3dl2(ip);
++			spu_hle::i3dl2_process(st.reverb, ip, host_in.data(), host_out.data(), kDspFormat, kDspChannels, frames, kDspSampleRate);
++			rec_params = &ip; rec_param_bytes = sizeof ip;
++			break;
++		case spu_hle::effect_id::atrac:
++		default:
++			// ATRAC scaffold: ATRAC3+ decode must route to ffmpeg (borrow the
++			// cellAdec ATRAC HLE). Passthrough for now so the chain never stalls.
++			std::memcpy(host_out.data(), host_in.data(), bytes);
++			break;
++		}
++	}
++
++	if (id != spu_hle::effect_id::meter)
++	{
++		be_t<u32>* dst = reinterpret_cast<be_t<u32>*>(audio);
++		const u32* src = reinterpret_cast<const u32*>(host_out.data());
++		for (u32 i = 0; i < bytes / 4; i++) dst[i] = src[i];
++	}
++
++	if (g_cfg.core.spu_dsp_hle_record)
++	{
++		static atomic_t<u32> s_seq{0};
++		const void* out_ptr = (id == spu_hle::effect_id::meter)
++			? static_cast<const void*>(&meter_out)
++			: static_cast<const void*>(host_out.data());
++		dsp_record(id, s_seq++, rec_params, rec_param_bytes, host_in.data(), out_ptr, out_bytes, static_cast<u32>(frames));
++	}
++}
++
+ bool spursHleStop(spu_thread& spu, u32 code)
+ {
+ 	// Trace: first hit of each code, then every 4096th (temporary diagnostics)
+@@ -197,6 +389,38 @@ bool spursHleStop(spu_thread& spu, u32 code)
+ 		to_lr = true;
+ 		break;
+ 	}
++	case SPURS_HLE_STOP_DSP_METER:
++	case SPURS_HLE_STOP_DSP_FILTER:
++	case SPURS_HLE_STOP_DSP_PARA_EQ:
++	case SPURS_HLE_STOP_DSP_I3DL2:
++	case SPURS_HLE_STOP_DSP_ATRAC:
++	{
++		// Real mstream DSP HLE. The effect identity is the stop code. Same vtable
++		// self-registration as the bypass (so the mixer keeps calling us), but a
++		// processing call runs the host effect over the block instead of no-op.
++		const u32 r3 = spu.gpr[3]._u32[3];
++		const u32 r6 = spu.gpr[6]._u32[3];
++		if (!dsp_is_process_call(r6))
++		{
++			// Registration: route the process-fn back to this stop address.
++			if (r3 < SPU_LS_SIZE - 16)
++			{
++				const auto desc = spu._ptr<be_t<u32>>(r3 & ~0x3);
++				desc[0] = spu.pc;
++				desc[1] = spu.pc;
++				desc[2] = 1;
++			}
++		}
++		else if (g_cfg.core.spu_dsp_hle)
++		{
++			// Processing call: run the host effect in place at the audio EA.
++			spursHleDspProcess(spu, code);
++		}
++		// If spu_dsp_hle is off we fall through as a dry bypass (audio untouched),
++		// so the plugin can be armed unconditionally without changing behaviour.
++		to_lr = true;
++		break;
++	}
+ 	default: fmt::throw_exception("spursHleStop: unknown code 0x%x", code);
+ 	}
+ 
+diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
+index dbbf1a1..81656e4 100644
+--- a/rpcs3/Emu/Cell/SPUThread.cpp
++++ b/rpcs3/Emu/Cell/SPUThread.cpp
+@@ -6548,6 +6548,11 @@ bool spu_thread::stop_and_signal(u32 code)
+ 	case SPURS_HLE_STOP_TASKSET_SYSCALL:
+ 	case SPURS_HLE_STOP_DSP_TRACE:
+ 	case SPURS_HLE_STOP_DSP_BYPASS:
++	case SPURS_HLE_STOP_DSP_METER:
++	case SPURS_HLE_STOP_DSP_FILTER:
++	case SPURS_HLE_STOP_DSP_PARA_EQ:
++	case SPURS_HLE_STOP_DSP_I3DL2:
++	case SPURS_HLE_STOP_DSP_ATRAC:
+ 	{
+ 		// Reserved stop codes only ever written into LS by the SPURS HLE
+ 		// (cellSpursSpu.cpp); the handler sets pc to the next guest address.
+diff --git a/rpcs3/Emu/system_config.h b/rpcs3/Emu/system_config.h
+index b6966fa..44db950 100644
+--- a/rpcs3/Emu/system_config.h
++++ b/rpcs3/Emu/system_config.h
+@@ -49,6 +49,8 @@ struct cfg_root : cfg::node
+ 		cfg::_bool spu_loop_detection{ this, "SPU loop detection", false }; // Try to detect wait loops and trigger thread yield
+ 		cfg::_int<1, 6> max_spurs_threads{ this, "Max SPURS Threads", 6, true }; // HACK. If less then 6, max number of running SPURS threads in each thread group.
+ 		cfg::_bool spurs_hle{ this, "SPURS HLE (experimental)", false }; // Divert known SPURS kernel images to the HLE scheduler in cellSpursSpu.cpp
++		cfg::_bool spu_dsp_hle{ this, "SPU DSP HLE (experimental)", false }; // Run mstream DSP effects (meter/filter/eq/reverb) as host C++ instead of guest SPU code
++		cfg::_bool spu_dsp_hle_record{ this, "SPU DSP HLE record", false }; // Capture DSP job I/O (params+input+output) to a .dspcap file for the host oracle
+ 		cfg::_enum<spu_block_size_type> spu_block_size{ this, "SPU Block Size", spu_block_size_type::safe };
+ 		cfg::_bool spu_accurate_dma{ this, "Accurate SPU DMA", false };
+ 		cfg::_bool spu_accurate_reservations{ this, "Accurate SPU Reservations", true };

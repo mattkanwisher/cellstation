@@ -1,0 +1,26 @@
+Version: 1.2
+
+"SPU-b5522754fbebb4db82061beea60da968ff46da64":
+  "bypass meter":
+    Games: {"Dead or Alive 5 Ultimate": {BLUS31216: [ All ]}}
+    Author: x
+    Patch Version: "1.0"
+    Patch: [ [ be32, 0x90, 0x00003f87 ] ]
+"SPU-2379c584746bcc87e8d87e1fdcd112600d090dc3":
+  "bypass filter":
+    Games: {"Dead or Alive 5 Ultimate": {BLUS31216: [ All ]}}
+    Author: x
+    Patch Version: "1.0"
+    Patch: [ [ be32, 0x90, 0x00003f87 ] ]
+"SPU-6783990ef3164dee43c67f62758719c58ccccc9e":
+  "bypass i3dl2":
+    Games: {"Dead or Alive 5 Ultimate": {BLUS31216: [ All ]}}
+    Author: x
+    Patch Version: "1.0"
+    Patch: [ [ be32, 0x98, 0x00003f87 ] ]
+"SPU-e433af6d732c289fddceca260581a622e2a356d1":
+  "bypass para_eq":
+    Games: {"Dead or Alive 5 Ultimate": {BLUS31216: [ All ]}}
+    Author: x
+    Patch Version: "1.0"
+    Patch: [ [ be32, 0x98, 0x00003f87 ] ]

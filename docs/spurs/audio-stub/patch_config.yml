@@ -1,0 +1,35 @@
+"SPU-702a721b683f370f79d5653baded1b015118d2ea":
+  "Audio stub msngSPURS_ATRAC":
+    "Dead or Alive 5 Ultimate":
+      "BLUS31216":
+        "All": false
+
+"SPU-91c6f169dd02b369fbf2ed20e12bf858f43c4c16":
+  "Audio stub at3dec":
+    "Dead or Alive 5 Ultimate":
+      "BLUS31216":
+        "All": false
+
+"SPU-2379c584746bcc87e8d87e1fdcd112600d090dc3":
+  "Audio stub mstream_dsp_filter":
+    "Dead or Alive 5 Ultimate":
+      "BLUS31216":
+        "All": true
+
+"SPU-6783990ef3164dee43c67f62758719c58ccccc9e":
+  "Audio stub mstream_dsp_i3dl2":
+    "Dead or Alive 5 Ultimate":
+      "BLUS31216":
+        "All": true
+
+"SPU-b5522754fbebb4db82061beea60da968ff46da64":
+  "Audio stub mstream_dsp_meter":
+    "Dead or Alive 5 Ultimate":
+      "BLUS31216":
+        "All": true
+
+"SPU-e433af6d732c289fddceca260581a622e2a356d1":
+  "Audio stub mstream_dsp_para_eq":
+    "Dead or Alive 5 Ultimate":
+      "BLUS31216":
+        "All": true

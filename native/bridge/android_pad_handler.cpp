@@ -169,9 +169,15 @@ PadHandlerBase::connection android_pad_handler::update_connection(const std::sha
 		return connection::disconnected;
 	}
 
-	// Report connected even before the first event: the pad must exist for the
-	// game to see a controller at all, and an idle pad simply reads as neutral.
-	return connection::connected;
+	// Respect the app-side connected flag so a deliberate disconnect->connect
+	// cycle (EmuBridge.setPadConnected false then true) produces a real
+	// connection transition. rpcs3's pad thread reacts to that edge by setting
+	// CELL_PAD_STATUS_ASSIGN_CHANGES on the next poll, which is what a game's
+	// "press START to assign a controller" screen waits for -- an injected
+	// button press alone never satisfies it. A physical press happens to be the
+	// first thing that drives this on real hardware; headless input needs to
+	// reproduce the transition explicitly.
+	return chrysalis::get_android_pad_state().connected ? connection::connected : connection::disconnected;
 }
 
 std::unordered_map<u32, u16> android_pad_handler::get_button_values(const std::shared_ptr<PadDevice>& device)
