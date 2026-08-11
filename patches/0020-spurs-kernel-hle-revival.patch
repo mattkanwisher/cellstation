@@ -7,34 +7,39 @@ the RegisterHleFunction divert mechanism it needed was removed years ago. This
 reintroduces interception as reserved SPU stop codes (0x3F80-0x3F85) written
 into LS at the kernel's fixed entry addresses when a recognized kernel image is
 deployed, gated behind the new default-off "SPURS HLE (experimental)" flag and a
-per-build SHA1 whitelist (currently DOA5U's kernel). Also fixes three bugs in
-the dormant code required for games that link the real libsre (whose policy
-modules run as guest code against the HLE kernel): the system-service idle
-handler read a never-refreshed LS mirror of the SPURS structure; the select-
-workload read-modify-write was not atomic against the modules' GETLLAR/PUTLLC;
-and unconditional publishes starved the modules' PUTLLCs (now publishes, and
+per-build SHA1 whitelist (currently DOA5U's kernel). Also fixes bugs in the
+dormant code required for games that link the real libsre (whose policy modules
+run as guest code against the HLE kernel): the system-service idle handler read
+a never-refreshed LS mirror of the SPURS structure; the select-workload read-
+modify-write was not atomic against the modules' GETLLAR/PUTLLC; and
+unconditional publishes starved the modules' PUTLLCs (now publishes, and
 notifies reservation waiters, only when the lock line actually changed).
+
+Completion-event path (this revision): the select-workload result encoding and
+the kernel->policy-module dispatch register ABI were verified byte-for-byte
+against the real DOA5U kernel2 disassembly (docs/spurs/doa5u-kernel2-blocks.txt
+blocks 0x848/0x6e8/0x820/0x838/0x290; see docs/spurs/spurs-hle-completion-fix.md)
+and MATCH — refuting the "select returns a wrong pollStatus/wid so the module
+skips its completion-send" hypothesis at the ABI level. The remaining stall is a
+missing SPU->PPU send: spursSysServiceUpdateShutdownCompletionEvents left the
+workload shutdown-completion notification as a bare TODO, so a guest PPU thread
+blocked in sys_event_queue_receive on the SPURS event queue was never woken.
+That send is now issued (same sys_spu_thread_send_event handshake the LLE kernel
+performs, matching the existing cleanup-path send). Adds flag-gated, rate-limited
+diagnostics in sys_event.cpp (sys_event_port_send / sys_event_queue_receive keyed
+by queue id) so the completion path can be A/B'd HLE-on vs HLE-off on-device to
+confirm which queue starves and which side owes the send.
+
 Status: WIP with rate-limited diagnostics. DOA5U under HLE: both instances
 schedule (audio heartbeats at its correct 187 Hz cadence; main instance runs
 the game's job chains ~1 s), wklFlag is unused by this title (receiver 0xFF),
-kernel context layout verified against the real kernel2 disassembly
-(docs/spurs/doa5u-kernel2-blocks.txt). Remaining stall: PPU threads cycle
-lwmutex/lwcond/event_queue_receive waiting on a SPURS job completion event
-that never arrives - completion-notification path under investigation.
+kernel context layout + select/dispatch ABI verified against the real kernel2
+disassembly. Completion-send fill-in is device-unverified (see the doc for the
+exact expected-vs-actual and the on-device experiment that confirms it).
 Upstream-status: not submitted (needs per-SDK-hash validation + the above)
---- a/rpcs3/Emu/system_config.h
-+++ b/rpcs3/Emu/system_config.h
-@@ -48,6 +48,7 @@
- 		cfg::_int<0, 16> spu_delay_penalty{ this, "SPU delay penalty", 3 }; // Number of milliseconds to block a thread if a virtual 'core' isn't free
- 		cfg::_bool spu_loop_detection{ this, "SPU loop detection", false }; // Try to detect wait loops and trigger thread yield
- 		cfg::_int<1, 6> max_spurs_threads{ this, "Max SPURS Threads", 6, true }; // HACK. If less then 6, max number of running SPURS threads in each thread group.
-+		cfg::_bool spurs_hle{ this, "SPURS HLE (experimental)", false }; // Divert known SPURS kernel images to the HLE scheduler in cellSpursSpu.cpp
- 		cfg::_enum<spu_block_size_type> spu_block_size{ this, "SPU Block Size", spu_block_size_type::safe };
- 		cfg::_bool spu_accurate_dma{ this, "Accurate SPU DMA", false };
- 		cfg::_bool spu_accurate_reservations{ this, "Accurate SPU Reservations", true };
 --- a/rpcs3/Emu/Cell/Modules/cellSpurs.h
 +++ b/rpcs3/Emu/Cell/Modules/cellSpurs.h
-@@ -119,6 +119,33 @@
+@@ -119,6 +119,33 @@ enum SPURSKernelInterfaces : u32
  	CELL_SPURS_KERNEL2_SELECT_WORKLOAD_ADDR = 0x290,
  };
  
@@ -70,23 +75,22 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  	CELL_SPURS_STATIC_PORT_RANGE_BOTTOM  = 15,
 --- a/rpcs3/Emu/Cell/Modules/cellSpursSpu.cpp
 +++ b/rpcs3/Emu/Cell/Modules/cellSpursSpu.cpp
-@@ -22,6 +22,11 @@
+@@ -21,6 +21,11 @@ LOG_CHANNEL(cellSpurs);
+ // Function prototypes
  //----------------------------------------------------------------------------
  
- //
++//
 +// SPURS HLE interception (see SpursHleStopCodes in cellSpurs.h)
 +//
 +static void spursHleWriteStop(u8* ls, u32 lsa, u32 code);
 +
-+//
+ //
  // SPURS utility functions
  //
- static void cellSpursModulePutTrace(CellSpursTracePacket* packet, u32 dmaTagId);
-@@ -82,7 +87,129 @@
- //
+@@ -83,6 +88,128 @@ static s32 spursTasksetLoadElf(spu_thread& spu, u32* entryPoint, u32* lowestLoad
  bool spursJobChainEntry(spu_thread& spu);
  void spursJobchainPopUrgentCommand(spu_thread& spu);
-+
+ 
 +//----------------------------------------------------------------------------
 +// SPURS HLE interception
 +//----------------------------------------------------------------------------
@@ -198,7 +202,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 +	}
 +	default: fmt::throw_exception("spursHleStop: unknown code 0x%x", code);
 +	}
- 
++
 +	if (to_lr)
 +	{
 +		// The HLE routine behaved as a call: return to the guest caller
@@ -212,7 +216,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  //----------------------------------------------------------------------------
  // SPURS utility functions
  //----------------------------------------------------------------------------
-@@ -270,9 +397,16 @@
+@@ -270,9 +397,16 @@ bool spursKernel1SelectWorkload(spu_thread& spu)
  	u32 wklSelectedId;
  	u32 pollStatus;
  
@@ -231,7 +235,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  		auto spurs = ctxt->spurs.get_ptr();
  
  		// Calculate the contention (number of SPUs used) for each workload
-@@ -433,7 +567,8 @@
+@@ -433,7 +567,8 @@ bool spursKernel1SelectWorkload(spu_thread& spu)
  		}
  
  		std::memcpy(ctxt, spurs, 128);
@@ -241,7 +245,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  
  	u64 result = u64{wklSelectedId} << 32;
  	result |= pollStatus;
-@@ -454,9 +589,12 @@
+@@ -454,9 +589,12 @@ bool spursKernel2SelectWorkload(spu_thread& spu)
  	u32 wklSelectedId;
  	u32 pollStatus;
  
@@ -256,7 +260,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  		auto spurs = ctxt->spurs.get_ptr();
  
  		// Calculate the contention (number of SPUs used) for each workload
-@@ -606,7 +744,8 @@
+@@ -606,7 +744,8 @@ bool spursKernel2SelectWorkload(spu_thread& spu)
  		}
  
  		std::memcpy(ctxt, spurs, 128);
@@ -266,7 +270,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  
  	u64 result = u64{wklSelectedId} << 32;
  	result |= pollStatus;
-@@ -631,16 +770,27 @@
+@@ -631,16 +770,27 @@ void spursKernelDispatchWorkload(spu_thread& spu, u64 widAndPollStatus)
  	const auto wklInfo = spu._ptr<CellSpurs::WorkloadInfo>(0x3FFE0);
  	std::memcpy(wklInfo, wklInfoOffset, 0x20);
  
@@ -296,7 +300,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  			break;
  		default:
  			std::memcpy(spu._ptr<void>(0xA00), wklInfo->addr.get_ptr(), wklInfo->size);
-@@ -672,6 +822,22 @@
+@@ -672,6 +822,22 @@ bool spursKernelWorkloadExit(spu_thread& spu)
  	const auto ctxt = spu._ptr<SpursKernelContext>(0x100);
  	const bool isKernel2 = ctxt->spurs->flags1 & SF1_32_WORKLOADS ? true : false;
  
@@ -319,7 +323,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  	// Select next workload to run
  	spu.gpr[3].clear();
  	if (isKernel2)
-@@ -768,7 +934,12 @@
+@@ -768,7 +934,12 @@ void spursSysServiceIdleHandler(spu_thread& spu, SpursKernelContext* ctxt)
  
  	while (true)
  	{
@@ -333,7 +337,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  		//vm::reservation_acquire(ctxt->spurs.addr());
  
  		// Find the number of SPUs that are idling in this SPURS instance
-@@ -852,6 +1023,21 @@
+@@ -852,6 +1023,21 @@ void spursSysServiceIdleHandler(spu_thread& spu, SpursKernelContext* ctxt)
  		// If all SPUs are idling and the exit_if_no_work flag is set then the SPU thread group must exit. Otherwise wait for external events.
  		if (spuIdling && shouldExit == false && foundReadyWorkload == false)
  		{
@@ -355,7 +359,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  			// The system service blocks by making a reservation and waiting on the lock line reservation lost event.
  			thread_ctrl::wait_for(1000);
  			continue;
-@@ -1026,7 +1212,9 @@
+@@ -1026,7 +1212,9 @@ void spursSysServiceProcessRequests(spu_thread& spu, SpursKernelContext* ctxt)
  // Activate a workload
  void spursSysServiceActivateWorkload(spu_thread& spu, SpursKernelContext* ctxt)
  {
@@ -366,6 +370,133 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  	std::memcpy(spu._ptr<void>(0x30000), ctxt->spurs->wklInfo1, 0x200);
  	if (spurs->flags1 & SF1_32_WORKLOADS)
  	{
+@@ -1127,7 +1315,7 @@ void spursSysServiceUpdateShutdownCompletionEvents(spu_thread& spu, SpursKernelC
+ 	// Mark the workloads in wklShutdownBitSet as completed and also generate a bit set of the completed
+ 	// workloads that have a shutdown completion hook registered
+ 	u32 wklNotifyBitSet;
+-	[[maybe_unused]] u8 spuPort;
++	u8 spuPort;
+ 	//vm::reservation_op(ctxt->spurs.ptr(&CellSpurs::wklState1).addr(), 128, [&]()
+ 	{
+ 		auto spurs = ctxt->spurs.get_ptr();
+@@ -1160,7 +1348,17 @@ void spursSysServiceUpdateShutdownCompletionEvents(spu_thread& spu, SpursKernelC
+ 
+ 	if (wklNotifyBitSet)
+ 	{
+-		// TODO: sys_spu_thread_send_event(spuPort, 0, wklNotifyMask);
++		// SPURS HLE completion-event path: notify the PPU-side waiters that these
++		// workloads have finished shutting down. The dormant HLE left this as a
++		// TODO, so a workload's shutdown-completion event was never delivered — a
++		// guest PPU thread blocked in sys_event_queue_receive on the SPURS event
++		// queue (via cellSpursWorkloadAttachLv2EventQueue) waits forever. This is
++		// the SPU->PPU half of the completion handshake the LLE kernel performs
++		// unconditionally here; spuPort is the SPURS-instance event port, data0=0
++		// selects the workload shutdown-completion class, and data1 carries the
++		// bitset of completed workloads that have a completion hook registered.
++		// (Whole HLE is gated behind the "SPURS HLE (experimental)" flag.)
++		sys_spu_thread_send_event(spu, spuPort, 0, wklNotifyBitSet);
+ 	}
+ }
+ 
+--- a/rpcs3/Emu/Cell/SPUThread.cpp
++++ b/rpcs3/Emu/Cell/SPUThread.cpp
+@@ -16,6 +16,7 @@
+ #include "Emu/Cell/lv2/sys_event_flag.h"
+ #include "Emu/Cell/lv2/sys_event.h"
+ #include "Emu/Cell/lv2/sys_interrupt.h"
++#include "Emu/Cell/Modules/cellSpurs.h"
+ 
+ #include "Emu/Cell/SPUDisAsm.h"
+ #include "Emu/Cell/SPUAnalyser.h"
+@@ -6539,6 +6540,20 @@ bool spu_thread::stop_and_signal(u32 code)
+ 
+ 	switch (code)
+ 	{
++	case SPURS_HLE_STOP_KERNEL_ENTRY:
++	case SPURS_HLE_STOP_WORKLOAD_EXIT:
++	case SPURS_HLE_STOP_SELECT_WORKLOAD:
++	case SPURS_HLE_STOP_SYS_SRV_ENTRY:
++	case SPURS_HLE_STOP_TASKSET_ENTRY:
++	case SPURS_HLE_STOP_TASKSET_SYSCALL:
++	case SPURS_HLE_STOP_DSP_TRACE:
++	case SPURS_HLE_STOP_DSP_BYPASS:
++	{
++		// Reserved stop codes only ever written into LS by the SPURS HLE
++		// (cellSpursSpu.cpp); the handler sets pc to the next guest address.
++		return spursHleStop(*this, code);
++	}
++
+ 	case 0x001:
+ 	{
+ 		state += cpu_flag::wait;
+--- a/rpcs3/Emu/Cell/lv2/sys_event.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_event.cpp
+@@ -4,6 +4,7 @@
+ #include "Emu/IdManager.h"
+ #include "Emu/IPC.h"
+ #include "Emu/System.h"
++#include "Emu/system_config.h" // SPURS HLE completion-path diagnostics (gated behind core.spurs_hle)
+ 
+ #include "Emu/Cell/ErrorCodes.h"
+ #include "Emu/Cell/PPUThread.h"
+@@ -468,6 +469,20 @@ error_code sys_event_queue_receive(ppu_thread& ppu, u32 equeue_id, vm::ptr<sys_e
+ 
+ 	sys_event.trace("sys_event_queue_receive(equeue_id=0x%x, *0x%x, timeout=0x%llx)", equeue_id, dummy_event, timeout);
+ 
++	// SPURS HLE completion-path diagnostic (off unless the experimental flag is
++	// set). The DOA5U stall shows PPU threads spinning here waiting on a SPURS
++	// job-completion event that never arrives; this logs which queue is polled
++	// and how hot it is. Cross-reference the port_send diagnostic below: a queue
++	// that is received-on but never sent-to is the starving queue. Rate-limited.
++	if (g_cfg.core.spurs_hle) [[unlikely]]
++	{
++		static atomic_t<u32> s_diag_rcv{};
++		if (const u32 n = s_diag_rcv++; n < 8 || (n & 1023) == 0)
++		{
++			sys_event.warning("[SPURS-HLE diag] queue_receive equeue_id=0x%x timeout=0x%llx n=%u", equeue_id, timeout, n + 1);
++		}
++	}
++
+ 	ppu.gpr[3] = CELL_OK;
+ 
+ 	const auto queue = idm::get<lv2_obj, lv2_event_queue>(equeue_id, [&, notify = lv2_obj::notify_all_t()](lv2_event_queue& queue) -> CellError
+@@ -774,6 +789,7 @@ error_code sys_event_port_send(u32 eport_id, u64 data1, u64 data2, u64 data3)
+ 	sys_event.trace("sys_event_port_send(eport_id=0x%x, data1=0x%llx, data2=0x%llx, data3=0x%llx)", eport_id, data1, data2, data3);
+ 
+ 	bool notified_thread = false;
++	u32 diag_queue_id = 0; // SPURS HLE completion-path diagnostic (set inside the lambda)
+ 
+ 	const auto port = idm::check<lv2_obj, lv2_event_port>(eport_id, [&, notify = lv2_obj::notify_all_t()](lv2_event_port& port) -> CellError
+ 	{
+@@ -786,6 +802,8 @@ error_code sys_event_port_send(u32 eport_id, u64 data1, u64 data2, u64 data3)
+ 
+ 		if (lv2_obj::check(port.queue))
+ 		{
++			diag_queue_id = port.queue->id;
++
+ 			const u64 source = port.name ? port.name : (u64{process_getpid() + 0u} << 32) | u64{eport_id};
+ 
+ 			return port.queue->send(source, data1, data2, data3, &notified_thread, ppu && port.queue->type == SYS_PPU_QUEUE ? &port : nullptr);
+@@ -794,6 +812,19 @@ error_code sys_event_port_send(u32 eport_id, u64 data1, u64 data2, u64 data3)
+ 		return CELL_ENOTCONN;
+ 	});
+ 
++	// SPURS HLE completion-path diagnostic (off unless the experimental flag is
++	// set): which event queues actually receive sends, keyed by target queue id.
++	// Compare with the queue_receive diagnostic to locate the queue that starves
++	// under HLE-on but is fed under HLE-off. Rate-limited.
++	if (g_cfg.core.spurs_hle) [[unlikely]]
++	{
++		static atomic_t<u32> s_diag_snd{};
++		if (const u32 n = s_diag_snd++; n < 32 || (n & 255) == 0)
++		{
++			sys_event.warning("[SPURS-HLE diag] port_send eport_id=0x%x -> queue=0x%x data1=0x%llx notified=%d n=%u", eport_id, diag_queue_id, data1, notified_thread, n + 1);
++		}
++	}
++
+ 	if (!port)
+ 	{
+ 		return CELL_ESRCH;
 --- a/rpcs3/Emu/Cell/lv2/sys_spu.cpp
 +++ b/rpcs3/Emu/Cell/lv2/sys_spu.cpp
 @@ -11,6 +11,8 @@
@@ -377,7 +508,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  #include "Emu/Cell/timers.hpp"
  #include "Emu/Memory/vm_reservation.h"
  #include "sys_interrupt.h"
-@@ -224,6 +226,27 @@
+@@ -224,6 +226,27 @@ void sys_spu_image::deploy(u8* loc, std::span<const sys_spu_segment> segs, bool
  		g_fxo->get<patch_engine>().apply(applied, Emu.GetTitleID() + '-' + hash, mem_translate);
  	}
  
@@ -405,34 +536,13 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  	(is_verbose ? spu_log.notice : sys_spu.trace)("Loaded SPU image: %s (<- %u)%s", hash, applied.size(), dump);
  }
  
---- a/rpcs3/Emu/Cell/SPUThread.cpp
-+++ b/rpcs3/Emu/Cell/SPUThread.cpp
-@@ -16,6 +16,7 @@
- #include "Emu/Cell/lv2/sys_event_flag.h"
- #include "Emu/Cell/lv2/sys_event.h"
- #include "Emu/Cell/lv2/sys_interrupt.h"
-+#include "Emu/Cell/Modules/cellSpurs.h"
- 
- #include "Emu/Cell/SPUDisAsm.h"
- #include "Emu/Cell/SPUAnalyser.h"
-@@ -6539,6 +6540,20 @@
- 
- 	switch (code)
- 	{
-+	case SPURS_HLE_STOP_KERNEL_ENTRY:
-+	case SPURS_HLE_STOP_WORKLOAD_EXIT:
-+	case SPURS_HLE_STOP_SELECT_WORKLOAD:
-+	case SPURS_HLE_STOP_SYS_SRV_ENTRY:
-+	case SPURS_HLE_STOP_TASKSET_ENTRY:
-+	case SPURS_HLE_STOP_TASKSET_SYSCALL:
-+	case SPURS_HLE_STOP_DSP_TRACE:
-+	case SPURS_HLE_STOP_DSP_BYPASS:
-+	{
-+		// Reserved stop codes only ever written into LS by the SPURS HLE
-+		// (cellSpursSpu.cpp); the handler sets pc to the next guest address.
-+		return spursHleStop(*this, code);
-+	}
-+
- 	case 0x001:
- 	{
- 		state += cpu_flag::wait;
+--- a/rpcs3/Emu/system_config.h
++++ b/rpcs3/Emu/system_config.h
+@@ -35,6 +35,7 @@ struct cfg_root : cfg::node
+ 		cfg::_int<0, 16> spu_delay_penalty{ this, "SPU delay penalty", 3 }; // Number of milliseconds to block a thread if a virtual 'core' isn't free
+ 		cfg::_bool spu_loop_detection{ this, "SPU loop detection", false }; // Try to detect wait loops and trigger thread yield
+ 		cfg::_int<1, 6> max_spurs_threads{ this, "Max SPURS Threads", 6, true }; // HACK. If less then 6, max number of running SPURS threads in each thread group.
++		cfg::_bool spurs_hle{ this, "SPURS HLE (experimental)", false }; // Divert known SPURS kernel images to the HLE scheduler in cellSpursSpu.cpp
+ 		cfg::_enum<spu_block_size_type> spu_block_size{ this, "SPU Block Size", spu_block_size_type::safe };
+ 		cfg::_bool spu_accurate_dma{ this, "Accurate SPU DMA", false };
+ 		cfg::_bool spu_accurate_reservations{ this, "Accurate SPU Reservations", true };
