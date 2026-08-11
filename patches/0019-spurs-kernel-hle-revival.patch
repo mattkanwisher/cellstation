@@ -14,10 +14,15 @@ handler read a never-refreshed LS mirror of the SPURS structure; the select-
 workload read-modify-write was not atomic against the modules' GETLLAR/PUTLLC;
 and unconditional publishes starved the modules' PUTLLCs (now publishes, and
 notifies reservation waiters, only when the lock line actually changed).
-Status: WIP experiment with rate-limited diagnostics left in. DOA5U: HLE kernel
-schedules the game's real workloads and the frame loop reaches ~42 fps, then
-stalls; the system SPURS instance re-dispatches its audio job chain at ~190 Hz
-(suspect: kernel2 ready-count consumption semantics). Not yet playable.
+Status: WIP experiment with rate-limited diagnostics left in. DOA5U: both SPURS
+instances schedule -- the system instance's audio job chain heartbeats at the
+correct 187 Hz cadence and the main instance runs the game's real job chains for
+the first second -- then the PPU side stops feeding work and stalls (frame loop
+froze at 42 fps). Verified against the real kernel2 disassembly (captured via
+SPU Debug): select writes the same lock-line quads (contention/pending/flag/
+signal+idling) and correctly leaves ready counts to the modules. Next suspect:
+the wklFlag (frame-sync) delivery semantics. Includes a deploy-time reference
+dump of recognized kernel images to <cache>/spurs-kernel-<hash>.bin.
 Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 --- a/rpcs3/Emu/system_config.h
 +++ b/rpcs3/Emu/system_config.h
@@ -119,7 +124,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 +	spursHleWriteStop(ls, CELL_SPURS_KERNEL2_EXIT_ADDR, SPURS_HLE_STOP_WORKLOAD_EXIT);
 +	spursHleWriteStop(ls, CELL_SPURS_KERNEL1_SELECT_WORKLOAD_ADDR, SPURS_HLE_STOP_SELECT_WORKLOAD);
 +}
-+
+ 
 +bool spursHleStop(spu_thread& spu, u32 code)
 +{
 +	// Trace: first hit of each code, then every 4096th (temporary diagnostics)
@@ -155,7 +160,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 +		// The HLE routine behaved as a call: return to the guest caller
 +		spu.pc = spu.gpr[0]._u32[3] & 0x3FFFC;
 +	}
- 
++
 +	// spu.pc holds the next guest address in either case; never fall through the stop
 +	return false;
 +}
@@ -247,7 +252,30 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  			break;
  		default:
  			std::memcpy(spu._ptr<void>(0xA00), wklInfo->addr.get_ptr(), wklInfo->size);
-@@ -768,7 +874,12 @@
+@@ -672,6 +778,22 @@
+ 	const auto ctxt = spu._ptr<SpursKernelContext>(0x100);
+ 	const bool isKernel2 = ctxt->spurs->flags1 & SF1_32_WORKLOADS ? true : false;
+ 
++	// Trace the scheduling inputs at workload exit (temporary diagnostics):
++	// which eligibility term keeps re-selecting a workload that just exited?
++	{
++		static atomic_t<u32> s_exit{};
++		const u32 n = s_exit++;
++		if (n < 32 || !(n & 1023))
++		{
++			const auto spurs = ctxt->spurs.get_ptr();
++			cellSpurs.warning("SPURS HLE exit[%u]: spurs=0x%x prev_wid=%u ready1[0]=%u ready2[0]=%u cur[0]=0x%x pend[0]=0x%x max[0]=0x%x sig1=0x%x sig2=0x%x msg=0x%x idling=0x%x runnable1=0x%x runnable2=0x%x prio[0]=0x%x",
++				n, ctxt->spurs.addr(), +ctxt->wklCurrentId, +spurs->wklReadyCount1[0], +spurs->wklIdleSpuCountOrReadyCount2[0],
++				+spurs->wklCurrentContention[0], +spurs->wklPendingContention[0], +spurs->wklMaxContention[0],
++				+spurs->wklSignal1.load(), +spurs->wklSignal2.load(), +spurs->sysSrvMessage.load(), +spurs->spuIdling,
++				+ctxt->wklRunnable1, +ctxt->wklRunnable2, +ctxt->priority[0]);
++		}
++	}
++
+ 	// Select next workload to run
+ 	spu.gpr[3].clear();
+ 	if (isKernel2)
+@@ -768,7 +890,12 @@
  
  	while (true)
  	{
@@ -261,7 +289,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  		//vm::reservation_acquire(ctxt->spurs.addr());
  
  		// Find the number of SPUs that are idling in this SPURS instance
-@@ -852,6 +963,21 @@
+@@ -852,6 +979,21 @@
  		// If all SPUs are idling and the exit_if_no_work flag is set then the SPU thread group must exit. Otherwise wait for external events.
  		if (spuIdling && shouldExit == false && foundReadyWorkload == false)
  		{
@@ -283,7 +311,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  			// The system service blocks by making a reservation and waiting on the lock line reservation lost event.
  			thread_ctrl::wait_for(1000);
  			continue;
-@@ -1026,7 +1152,9 @@
+@@ -1026,7 +1168,9 @@
  // Activate a workload
  void spursSysServiceActivateWorkload(spu_thread& spu, SpursKernelContext* ctxt)
  {
@@ -305,7 +333,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  #include "Emu/Cell/timers.hpp"
  #include "Emu/Memory/vm_reservation.h"
  #include "sys_interrupt.h"
-@@ -224,6 +226,15 @@
+@@ -224,6 +226,27 @@
  		g_fxo->get<patch_engine>().apply(applied, Emu.GetTitleID() + '-' + hash, mem_translate);
  	}
  
@@ -314,6 +342,18 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 +	// start, which redeploys the image).
 +	if (g_cfg.core.spurs_hle && spursHleKnownKernel(hash))
 +	{
++		// One-time reference dump of the pristine deployed image (kernel +
++		// embedded system-service module) for offline disassembly, taken
++		// before the stop opcodes overwrite the entry points.
++		if (const std::string dump_path = fs::get_cache_dir() + "spurs-kernel-" + hash + ".bin"; !fs::is_file(dump_path))
++		{
++			if (fs::file f{dump_path, fs::rewrite})
++			{
++				f.write(loc, 0x3000);
++				spu_log.success("SPURS HLE: dumped kernel image to %s", dump_path);
++			}
++		}
++
 +		spursHleArmKernel(loc);
 +		spu_log.success("SPURS HLE: diverting kernel image %s", hash);
 +	}
