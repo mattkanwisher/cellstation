@@ -1,0 +1,88 @@
+Subject: jit: export a Linux perf map of JIT'd functions, opt-in via env var
+Why: profiles of real gameplay show ~58% of CPU samples landing in anonymous
+ JIT mappings with no symbols (docs/PROFILE-doa5.md), which makes flame
+ graphs useless for the dominant cost. jit_announce() already receives every
+ JIT'd function's address, size and name; a perf-map writer for it exists in
+ the tree but is compiled out (#if 0). Re-enable it behind the
+ RPCS3_PERF_MAP_DIR environment variable: when set, write
+ "<addr> <size> <name>" lines to <dir>/perf-<pid>.map (the perf(1) JIT
+ interface format). Re-check the variable while the file is unopened so
+ announces from static initializers, which run before the Android bridge can
+ setenv() in initialize(), do not permanently disable the export. Keep the
+ file on exit (the original deleted it) because on Android symbolization
+ happens after the process dies. Also swallow the jit_announce(0,0,"")
+ shutdown sentinel instead of logging a spurious "Empty function announced"
+ error.
+Upstream-status: candidate
+
+diff --git a/Utilities/JITASM.cpp b/Utilities/JITASM.cpp
+index 962f347..231baa0 100644
+--- a/Utilities/JITASM.cpp
++++ b/Utilities/JITASM.cpp
+@@ -10,6 +10,7 @@
+ #include "util/simd.hpp"
+ 
+ #ifdef __linux__
++#include <cstdlib>
+ #include <unistd.h>
+ #define CAN_OVERCOMMIT
+ #endif
+@@ -23,34 +24,43 @@ LOG_CHANNEL(jit_log, "JIT");
+ void jit_announce(uptr func, usz size, std::string_view name)
+ {
+ #ifdef __linux__
+-#if 0
+-	static const struct tmp_perf_map
++	// Perf-map export (Linux perf JIT interface): one "<addr> <size> <name>" line
++	// per JIT'd function, so sampling profilers can attribute anonymous-mapping
++	// samples to guest code. Disabled unless RPCS3_PERF_MAP_DIR names a writable
++	// directory (use /tmp for perf(1)'s standard perf-<pid>.map location). The
++	// file is deliberately kept on exit: on Android the profile is symbolized
++	// after the process is gone.
++	static struct perf_map
+ 	{
+-		std::string name{fmt::format("/tmp/perf-%d.map", getpid())};
+-		fs::file data{name, fs::rewrite + fs::append};
++		fs::file data;
+ 
+-		tmp_perf_map() = default;
+-		tmp_perf_map(const tmp_perf_map&) = delete;
+-		tmp_perf_map& operator=(const tmp_perf_map&) = delete;
+-
+-		~tmp_perf_map()
++		void try_open()
+ 		{
+-			fs::remove_file(name);
++			if (const char* dir = std::getenv("RPCS3_PERF_MAP_DIR"); dir && dir[0])
++			{
++				data.open(fmt::format("%s/perf-%d.map", dir, getpid()), fs::rewrite + fs::append);
++			}
+ 		}
+ 	} s_map;
+ 
+-	if (size && name.size())
++	// Re-check the environment while unopened: the earliest announces (static
++	// initializers) can precede the host app setting the variable.
++	if (!s_map.data)
++	{
++		s_map.try_open();
++	}
++
++	if (s_map.data && func && size && name.size())
+ 	{
+ 		s_map.data.write(fmt::format("%x %x %s\n", func, size, name));
+ 	}
++#endif
+ 
+-	if (!func && !size && !name.size())
++	if (!func && !size && name.empty())
+ 	{
+-		fs::remove_file(s_map.name);
++		// Shutdown sentinel (see rpcs3.cpp); nothing to clean up.
+ 		return;
+ 	}
+-#endif
+-#endif
+ 
+ 	if (!size)
+ 	{

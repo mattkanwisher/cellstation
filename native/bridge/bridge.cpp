@@ -53,6 +53,8 @@
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <sys/resource.h>
+#include <sys/system_properties.h>
+#include <cstdlib>
 
 #include <deque>
 
@@ -748,6 +750,20 @@ JNIEXPORT jboolean JNICALL Java_nu_hyperworks_cellstation_EmuBridge_initialize(J
 	g_android_cache_dir = root + "/cache/";
 	fs::create_path(g_android_config_dir);
 	fs::create_path(g_android_cache_dir);
+
+	// Dev-only JIT symbolization for flame graphs (docs/FLAMEGRAPHS.md):
+	// `adb shell setprop debug.cellstation.perfmap 1` before launching makes the
+	// core write cache/perf-<pid>.map naming every JIT'd guest function. Early
+	// static-init announces predate this setenv; jit_announce re-checks until
+	// the variable appears (patch 0018).
+	char perfmap_prop[PROP_VALUE_MAX]{};
+	if (__system_property_get("debug.cellstation.perfmap", perfmap_prop) > 0 &&
+		(perfmap_prop[0] == '1' || perfmap_prop[0] == 't' || perfmap_prop[0] == 'y'))
+	{
+		const std::string perfmap_dir = root + "/cache";
+		setenv("RPCS3_PERF_MAP_DIR", perfmap_dir.c_str(), 1);
+		cellstation_log.notice("JIT perf-map export enabled (%s/perf-<pid>.map)", perfmap_dir);
+	}
 
 	raise_rlimits();
 
