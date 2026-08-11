@@ -34,10 +34,12 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  		cfg::_bool spu_accurate_reservations{ this, "Accurate SPU Reservations", true };
 --- a/rpcs3/Emu/Cell/Modules/cellSpurs.h
 +++ b/rpcs3/Emu/Cell/Modules/cellSpurs.h
-@@ -119,6 +119,31 @@
+@@ -117,8 +117,34 @@
+ 	CELL_SPURS_KERNEL2_EXIT_ADDR            = 0x838,
+ 	CELL_SPURS_KERNEL1_SELECT_WORKLOAD_ADDR = 0x290,
  	CELL_SPURS_KERNEL2_SELECT_WORKLOAD_ADDR = 0x290,
- };
- 
++};
++
 +// SPURS HLE (see cellSpursSpu.cpp): reserved SPU stop codes written into local
 +// storage at the kernel/policy-module entry points of a recognized SPURS kernel
 +// image, diverting execution to the HLE scheduler. Top of the 14-bit stop-code
@@ -50,7 +52,8 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 +	SPURS_HLE_STOP_SYS_SRV_ENTRY   = 0x3F83,
 +	SPURS_HLE_STOP_TASKSET_ENTRY   = 0x3F84,
 +	SPURS_HLE_STOP_TASKSET_SYSCALL = 0x3F85,
-+};
++	SPURS_HLE_STOP_DSP_TRACE       = 0x3F86, // log a job descriptor at entry (SPU-HLE pipeline: capture the I/O contract)
+ };
 +
 +class spu_thread;
 +
@@ -59,7 +62,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 +
 +// Write the kernel-entry stop opcodes into a freshly deployed SPURS kernel image (called from sys_spu_image::deploy)
 +void spursHleArmKernel(u8* ls);
-+
+ 
 +// Whether this SPU image hash is a SPURS kernel build whose LS layout matches the HLE ("SPU-<sha1>" format)
 +bool spursHleKnownKernel(const std::string& hash);
 +
@@ -80,12 +83,10 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  // SPURS utility functions
  //
  static void cellSpursModulePutTrace(CellSpursTracePacket* packet, u32 dmaTagId);
-@@ -82,7 +87,85 @@
- //
- bool spursJobChainEntry(spu_thread& spu);
+@@ -84,6 +89,105 @@
  void spursJobchainPopUrgentCommand(spu_thread& spu);
-+
-+//----------------------------------------------------------------------------
+ 
+ //----------------------------------------------------------------------------
 +// SPURS HLE interception
 +//----------------------------------------------------------------------------
 +
@@ -122,7 +123,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 +	spursHleWriteStop(ls, CELL_SPURS_KERNEL2_EXIT_ADDR, SPURS_HLE_STOP_WORKLOAD_EXIT);
 +	spursHleWriteStop(ls, CELL_SPURS_KERNEL1_SELECT_WORKLOAD_ADDR, SPURS_HLE_STOP_SELECT_WORKLOAD);
 +}
- 
++
 +bool spursHleStop(spu_thread& spu, u32 code)
 +{
 +	// Trace: first hit of each code, then every 4096th (temporary diagnostics)
@@ -150,6 +151,27 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 +	case SPURS_HLE_STOP_SYS_SRV_ENTRY: to_lr = spursSysServiceEntry(spu); break;
 +	case SPURS_HLE_STOP_TASKSET_ENTRY: to_lr = spursTasksetEntry(spu); break;
 +	case SPURS_HLE_STOP_TASKSET_SYSCALL: to_lr = spursTasksetSyscallEntry(spu); break;
++	case SPURS_HLE_STOP_DSP_TRACE:
++	{
++		// SPU-HLE pipeline: empirically capture a job's I/O contract at entry.
++		// Log the argument registers and the descriptor bytes r3 points at, then
++		// behave like the original entry instruction we replaced (a return via lr)
++		// so the game keeps its current behaviour. Rate-limited.
++		static atomic_t<u32> s_t{0};
++		const u32 n = s_t++;
++		if (n < 24)
++		{
++			const u32 r3 = spu.gpr[3]._u32[3];
++			const u32 dsc = r3 & 0x3FF80;
++			const u8* p = spu._ptr<u8>(dsc);
++			std::string hex;
++			for (u32 i = 0; i < 128; i++) fmt::append(hex, "%02x%s", p[i], (i % 16 == 15) ? " " : "");
++			cellSpurs.error("DSP-TRACE[%u] spu=%s pc=0x%x lr=0x%x r3=0x%x r4=0x%x r5=0x%x r6=0x%x | LS[0x%x]: %s",
++				n, spu.get_name(), spu.pc, spu.gpr[0]._u32[3], r3, spu.gpr[4]._u32[3], spu.gpr[5]._u32[3], spu.gpr[6]._u32[3], dsc, hex);
++		}
++		to_lr = true;
++		break;
++	}
 +	default: fmt::throw_exception("spursHleStop: unknown code 0x%x", code);
 +	}
 +
@@ -163,10 +185,11 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
 +	return false;
 +}
 +
- //----------------------------------------------------------------------------
++//----------------------------------------------------------------------------
  // SPURS utility functions
  //----------------------------------------------------------------------------
-@@ -270,9 +353,16 @@
+ 
+@@ -270,9 +374,16 @@
  	u32 wklSelectedId;
  	u32 pollStatus;
  
@@ -185,7 +208,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  		auto spurs = ctxt->spurs.get_ptr();
  
  		// Calculate the contention (number of SPUs used) for each workload
-@@ -433,7 +523,8 @@
+@@ -433,7 +544,8 @@
  		}
  
  		std::memcpy(ctxt, spurs, 128);
@@ -195,7 +218,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  
  	u64 result = u64{wklSelectedId} << 32;
  	result |= pollStatus;
-@@ -454,9 +545,12 @@
+@@ -454,9 +566,12 @@
  	u32 wklSelectedId;
  	u32 pollStatus;
  
@@ -210,7 +233,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  		auto spurs = ctxt->spurs.get_ptr();
  
  		// Calculate the contention (number of SPUs used) for each workload
-@@ -606,7 +700,8 @@
+@@ -606,7 +721,8 @@
  		}
  
  		std::memcpy(ctxt, spurs, 128);
@@ -220,7 +243,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  
  	u64 result = u64{wklSelectedId} << 32;
  	result |= pollStatus;
-@@ -631,16 +726,27 @@
+@@ -631,16 +747,27 @@
  	const auto wklInfo = spu._ptr<CellSpurs::WorkloadInfo>(0x3FFE0);
  	std::memcpy(wklInfo, wklInfoOffset, 0x20);
  
@@ -250,7 +273,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  			break;
  		default:
  			std::memcpy(spu._ptr<void>(0xA00), wklInfo->addr.get_ptr(), wklInfo->size);
-@@ -672,6 +778,22 @@
+@@ -672,6 +799,22 @@
  	const auto ctxt = spu._ptr<SpursKernelContext>(0x100);
  	const bool isKernel2 = ctxt->spurs->flags1 & SF1_32_WORKLOADS ? true : false;
  
@@ -273,7 +296,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  	// Select next workload to run
  	spu.gpr[3].clear();
  	if (isKernel2)
-@@ -768,7 +890,12 @@
+@@ -768,7 +911,12 @@
  
  	while (true)
  	{
@@ -287,7 +310,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  		//vm::reservation_acquire(ctxt->spurs.addr());
  
  		// Find the number of SPUs that are idling in this SPURS instance
-@@ -852,6 +979,21 @@
+@@ -852,6 +1000,21 @@
  		// If all SPUs are idling and the exit_if_no_work flag is set then the SPU thread group must exit. Otherwise wait for external events.
  		if (spuIdling && shouldExit == false && foundReadyWorkload == false)
  		{
@@ -309,7 +332,7 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  			// The system service blocks by making a reservation and waiting on the lock line reservation lost event.
  			thread_ctrl::wait_for(1000);
  			continue;
-@@ -1026,7 +1168,9 @@
+@@ -1026,7 +1189,9 @@
  // Activate a workload
  void spursSysServiceActivateWorkload(spu_thread& spu, SpursKernelContext* ctxt)
  {
@@ -369,17 +392,19 @@ Upstream-status: not submitted (needs per-SDK-hash validation + the above)
  
  #include "Emu/Cell/SPUDisAsm.h"
  #include "Emu/Cell/SPUAnalyser.h"
-@@ -6539,6 +6540,18 @@
+@@ -6538,7 +6539,20 @@
+ 	};
  
  	switch (code)
- 	{
++	{
 +	case SPURS_HLE_STOP_KERNEL_ENTRY:
 +	case SPURS_HLE_STOP_WORKLOAD_EXIT:
 +	case SPURS_HLE_STOP_SELECT_WORKLOAD:
 +	case SPURS_HLE_STOP_SYS_SRV_ENTRY:
 +	case SPURS_HLE_STOP_TASKSET_ENTRY:
 +	case SPURS_HLE_STOP_TASKSET_SYSCALL:
-+	{
++	case SPURS_HLE_STOP_DSP_TRACE:
+ 	{
 +		// Reserved stop codes only ever written into LS by the SPURS HLE
 +		// (cellSpursSpu.cpp); the handler sets pc to the next guest address.
 +		return spursHleStop(*this, code);
