@@ -1,0 +1,10 @@
+# Pi/CM5 additions on top of upstream's base list. The boot-chain packages
+# (kernel, firmware) are installed explicitly in build/mkimage.sh before this
+# list; this is the userspace side.
+
+# VideoCore VII graphics: GLES via mesa, Vulkan via v3dv
+mesa
+vulkan-broadcom
+
+# libcamera stack for CSI cameras on the carrier
+libcamera

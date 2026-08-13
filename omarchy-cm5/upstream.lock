@@ -1,0 +1,6 @@
+# Pinned upstream Omarchy checkout used by build/fetch-upstream.sh.
+# Bump deliberately: Quattro is alpha and moves fast.
+OMARCHY_REPO=https://github.com/basecamp/omarchy
+OMARCHY_BRANCH=quattro
+OMARCHY_REF=82ae514609e32507e7d59e653694dda6ae58d9af
+OMARCHY_VERSION=4.0.0.alpha

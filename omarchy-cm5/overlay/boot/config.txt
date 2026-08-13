@@ -1,0 +1,19 @@
+# Raspberry Pi firmware config for omarchy-cm5 (CM5 / BCM2712).
+
+# 16K-page Pi kernel from Arch Linux ARM. If a binary misbehaves on 16K
+# pages, switch to the 4K build: kernel=kernel8.img via linux-rpi.
+kernel=kernel_2712.img
+arm_64bit=1
+
+# Full KMS — required for Hyprland/wlroots-style compositors on v3d.
+dtoverlay=vc4-kms-v3d-pi5
+max_framebuffers=2
+disable_overscan=1
+
+# PCIe (NVMe on the carrier). Gen 3 is the usual CM5 carrier choice.
+dtparam=pciex1
+dtparam=pciex1_gen=3
+
+# --- carrier-specific (TensorFleet) -----------------------------------------
+# TODO: LVDS/DSI panel overlay + timings for vaio_cm5_carrier / koyomi-lvds-hat
+# dtoverlay=...

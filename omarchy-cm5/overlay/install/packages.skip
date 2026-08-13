@@ -1,0 +1,18 @@
+# Packages from upstream install/omarchy-base.packages excluded on aarch64,
+# with the reason. Keep this list short and honest — every entry is a small
+# divergence from stock Omarchy. Grow it from real build failures only.
+
+# x86-only or ARM-broken (community-reported on Pi 5 attempts)
+obsidian
+pinta
+
+# Laptop-display control; pointless on a fixed CM5 carrier
+asdcontrol
+
+# x86→ARM emulation shim; we ARE the ARM side
+qemu-user-static-binfmt
+
+# Heavy desktop apps deferred until after first boot works (re-enable later)
+kdenlive
+libreoffice-fresh
+obs-studio
