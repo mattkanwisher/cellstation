@@ -55,14 +55,8 @@ the ALARM tarball + pacman directly rather than starting from their SD images.
 Fallback if ALARM bites: the same overlay on Manjaro ARM (what the community
 Pi 5 guide used), at the cost of more package-name drift.
 
-## Publishing note
+## Provenance
 
-This directory is developed inside `cellstation` only because the session
-couldn't create the TensorFleet repo (GitHub app lacks repo-creation
-permission). It is fully self-contained: create an empty
-`TensorFleet/omarchy-cm5` and split it out with
-
-```sh
-git subtree split -P omarchy-cm5 -b omarchy-cm5-main
-git push git@github.com:TensorFleet/omarchy-cm5.git omarchy-cm5-main:main
-```
+Canonical home: `TensorFleet/omarchy-cm5`. Initially scaffolded in a
+session workspace inside `mattkanwisher/cellstation`
+(branch `claude/omarchy-quattro-rp-cm5-seobqb`).
